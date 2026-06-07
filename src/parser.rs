@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::model::Tokens;
+use crate::model::{Tokens, UsageEvent};
 
 #[derive(Debug, Default, Clone)]
 pub struct JsonlSummary {
@@ -84,6 +84,65 @@ pub fn sum_jsonl(path: &Path, resume_from_offset: u64) -> Result<JsonlSummary> {
         }
     }
     Ok(summary)
+}
+
+/// Stream events with timestamps. Used for block / daily aggregation —
+/// the aggregate `sum_jsonl` path remains for cached totals.
+///
+/// `since_ms` filters events older than this (set to `0` for all).
+/// Unlike `sum_jsonl` this does not advance any byte_offset — callers
+/// must accept that we re-read whichever range they want each call.
+pub fn events_jsonl(path: &Path, since_ms: i64) -> anyhow::Result<Vec<UsageEvent>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut events = Vec::new();
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if buf.last() != Some(&b'\n') {
+            break;
+        }
+        if !contains_subslice(&buf, NEEDLE) {
+            continue;
+        }
+        let Ok(v): serde_json::Result<serde_json::Value> = serde_json::from_slice(&buf) else {
+            continue;
+        };
+        let Some(ts_str) = v.get("timestamp").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) else {
+            continue;
+        };
+        let ts_ms = ts.timestamp_millis();
+        if ts_ms < since_ms {
+            continue;
+        }
+        let Some(usage) = v.pointer("/message/usage") else {
+            continue;
+        };
+        let tokens = Tokens {
+            input: as_u64(usage.get("input_tokens")),
+            output: as_u64(usage.get("output_tokens")),
+            cache_creation: as_u64(usage.get("cache_creation_input_tokens")),
+            cache_read: as_u64(usage.get("cache_read_input_tokens")),
+        };
+        let model = v
+            .pointer("/message/model")
+            .and_then(|m| m.as_str())
+            .filter(|m| *m != "<synthetic>")
+            .map(String::from);
+        events.push(UsageEvent {
+            timestamp_ms: ts_ms,
+            tokens,
+            model,
+        });
+    }
+    Ok(events)
 }
 
 fn as_u64(v: Option<&serde_json::Value>) -> u64 {

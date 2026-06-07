@@ -50,3 +50,12 @@ pub struct SessionRow {
     /// the model is unknown / synthetic / has no transcript data.
     pub cost_usd: Option<f64>,
 }
+
+/// A single assistant-message-with-usage event. Used for time-based
+/// analysis (5-hour blocks, daily rollups, burn rate).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageEvent {
+    pub timestamp_ms: i64,
+    pub tokens: Tokens,
+    pub model: Option<String>,
+}

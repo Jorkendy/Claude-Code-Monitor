@@ -1,9 +1,9 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::{cache, joiner, model::SessionRow, pricing, renderer, scanner};
+use crate::{api, blocks, cache, model::SessionRow, parser, pricing, renderer, scanner};
 
 #[derive(Parser, Debug)]
 #[command(name = "cc-monitor", about = "Claude Code session monitor (read-only)")]
@@ -35,40 +35,40 @@ pub struct Args {
     /// Drill down per-subagent breakdown for a session (not implemented yet)
     #[arg(long, value_name = "SESSION_ID")]
     pub subagents: Option<String>,
+
+    /// Show 5-hour billing blocks instead of the session list
+    #[arg(long)]
+    pub blocks: bool,
 }
 
 impl Args {
     pub fn run(self) -> Result<()> {
-        let root = match self.root.clone() {
-            Some(p) => p,
-            None => dirs::home_dir()
-                .map(|h| h.join(".claude"))
-                .context("cannot resolve $HOME")?,
-        };
-        let scan = scanner::scan(&root)?;
-        let mut cache = cache::load(&root)?;
+        let root = api::resolve_root(self.root.clone())?;
         let opts = renderer::RenderOpts {
             include_cache_read: self.include_cache_read,
             full: self.full,
         };
         if let Some(prefix) = &self.subagents {
+            let scan = scanner::scan(&root)?;
+            let mut cache = cache::load(&root)?;
             let sid = resolve_session_prefix(&scan, prefix)?;
             renderer::render_subagent_drilldown(&scan, &mut cache, &sid, &opts)?;
             cache::save(&root, &cache)?;
             return Ok(());
         }
-        let mut rows = joiner::join(&scan, &mut cache)?;
-        cache::save(&root, &cache)?;
-        let pricing_table = pricing::load();
-        for row in &mut rows {
-            row.cost_usd = row.model.as_deref().and_then(|m| {
-                pricing::lookup(&pricing_table, m).map(|p| {
-                    let mut combined = row.tokens;
-                    combined.add(&row.subagent_tokens);
-                    pricing::cost_usd(p, &combined)
-                })
-            });
+        if self.blocks {
+            let scan = scanner::scan(&root)?;
+            let pricing_table = pricing::load();
+            let mut events = Vec::new();
+            for p in scan.transcript_files.iter().chain(&scan.subagent_files) {
+                events.extend(parser::events_jsonl(p, 0).unwrap_or_default());
+            }
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let detected = blocks::detect_blocks(events, now_ms);
+            renderer::render_blocks(&detected, &pricing_table, now_ms, self.json)?;
+            return Ok(());
         }
+        let mut rows = api::list_sessions(Some(root.clone()))?;
         if let Some(repo) = &self.repo {
             rows.retain(|r| {
                 r.cwd

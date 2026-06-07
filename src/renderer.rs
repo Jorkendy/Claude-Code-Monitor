@@ -1,11 +1,15 @@
 // Renderer: simple terminal table (default) or JSON (--json).
 // Compact number formatting (55.7K) unless --full.
 
+use crate::blocks::SessionBlock;
 use crate::cache::{self, CacheFile};
 use crate::model::{LiveStatus, SessionRow, Tokens};
+use crate::pricing::{self, ModelPricing};
 use crate::scanner::ScanResult;
 use anyhow::Result;
+use chrono::{DateTime, Local};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -185,6 +189,126 @@ pub fn render_subagent_drilldown(
         println!("{line}");
     }
     Ok(())
+}
+
+pub fn render_blocks(
+    blocks: &[SessionBlock],
+    pricing_table: &HashMap<String, ModelPricing>,
+    now_ms: i64,
+    as_json: bool,
+) -> Result<()> {
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(blocks)?);
+        return Ok(());
+    }
+    if blocks.is_empty() {
+        println!("No blocks found.");
+        return Ok(());
+    }
+    let header = [
+        "WINDOW", "STATE", "MSGS", "IN", "OUT", "C-WRITE", "C-READ", "COST", "MODELS", "RESET-IN",
+    ];
+    let mut grid: Vec<Vec<String>> = Vec::with_capacity(blocks.len() + 1);
+    grid.push(header.iter().map(|s| s.to_string()).collect());
+
+    for b in blocks {
+        if b.is_gap {
+            grid.push(vec![
+                format!(
+                    "{}  (gap {})",
+                    fmt_clock(b.start_ms),
+                    fmt_duration(b.end_ms - b.start_ms)
+                ),
+                "gap".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+            ]);
+            continue;
+        }
+        let cost = block_cost(b, pricing_table);
+        let state = if b.is_active { "ACTIVE" } else { "closed" };
+        let reset = if b.is_active {
+            fmt_duration((b.end_ms - now_ms).max(0))
+        } else {
+            "-".into()
+        };
+        let window = format!(
+            "{} → {}",
+            fmt_clock(b.start_ms),
+            fmt_clock(b.end_ms)
+        );
+        let cost_str = match cost {
+            Some(c) => format!("${c:.2}"),
+            None => "N/A".into(),
+        };
+        grid.push(vec![
+            window,
+            state.into(),
+            b.message_count.to_string(),
+            compact(b.tokens.input),
+            compact(b.tokens.output),
+            compact(b.tokens.cache_creation),
+            compact(b.tokens.cache_read),
+            cost_str,
+            b.models.join(","),
+            reset,
+        ]);
+    }
+    let cols = header.len();
+    let widths: Vec<usize> = (0..cols)
+        .map(|i| grid.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
+        .collect();
+    let numeric_cols = 2..=7;
+    for row in &grid {
+        let mut line = String::new();
+        for (i, cell) in row.iter().enumerate() {
+            let w = widths[i];
+            if numeric_cols.contains(&i) {
+                let _ = write!(line, "{cell:>w$}");
+            } else {
+                let _ = write!(line, "{cell:<w$}");
+            }
+            if i < cols - 1 {
+                line.push_str("  ");
+            }
+        }
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn block_cost(b: &SessionBlock, table: &HashMap<String, ModelPricing>) -> Option<f64> {
+    // Use first non-empty model as the cost basis. Multi-model blocks are rare
+    // in practice; if it matters we can per-event cost later.
+    let m = b.models.first()?;
+    let p = pricing::lookup(table, m)?;
+    Some(pricing::cost_usd(p, &b.tokens))
+}
+
+fn fmt_clock(ts_ms: i64) -> String {
+    DateTime::from_timestamp_millis(ts_ms)
+        .map(|t| t.with_timezone(&Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "?".into())
+}
+
+fn fmt_duration(ms: i64) -> String {
+    if ms < 0 {
+        return "0m".into();
+    }
+    let secs = ms / 1000;
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else {
+        format!("{m}m")
+    }
 }
 
 fn read_meta(path: &Path) -> Option<(String, String)> {
