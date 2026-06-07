@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { onMount } from "svelte";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { onMount, onDestroy } from "svelte";
 
   type Tokens = {
     input: number;
@@ -39,7 +40,12 @@
     }
   }
 
-  onMount(load);
+  let unlisten: UnlistenFn | undefined;
+  onMount(async () => {
+    await load();
+    unlisten = await listen("data-changed", () => load());
+  });
+  onDestroy(() => unlisten?.());
 
   function short(id: string): string {
     return id.slice(0, 8);
