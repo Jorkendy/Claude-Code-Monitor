@@ -121,12 +121,40 @@ pub fn cost_usd(p: &ModelPricing, t: &Tokens) -> f64 {
         / 1_000_000.0
 }
 
-/// Context window limit by model. All current Claude models are 200K. The
-/// 1M-token Opus variant is opt-in via API header and currently has no
-/// distinct model id in `~/.claude` data, so we treat 200K as the safe
-/// default. If we ever surface 1M sessions, add a per-model override here.
+/// Static context window limit by model. Sonnet 4.5+ and Haiku 4.5 support
+/// a 1M beta (header `context-1m-2025-08-07`); Claude Code only enables it
+/// when the user opts in, and the model id in `~/.claude` is the same
+/// either way. The static table is the conservative default; callers should
+/// reach `context_limit_observed()` so a session that has clearly exceeded
+/// 200K bumps to 1M instead of showing `145%`.
 pub const DEFAULT_CONTEXT_LIMIT: u64 = 200_000;
+pub const EXTENDED_CONTEXT_LIMIT: u64 = 1_000_000;
+
+fn supports_1m_context(model: &str) -> bool {
+    // Family check, not exact id, so future point-releases stay covered.
+    let m = model.to_ascii_lowercase();
+    m.starts_with("claude-sonnet-4-5")
+        || m.starts_with("claude-sonnet-4-6")
+        || m.starts_with("claude-sonnet-4-7")
+        || m.starts_with("claude-haiku-4-5")
+}
 
 pub fn context_limit_for(_model: &str) -> u64 {
     DEFAULT_CONTEXT_LIMIT
+}
+
+/// Pick the limit using both model family AND the observed prompt size.
+/// If the prompt has already crossed the 200K static cap on a 1M-capable
+/// model, the beta header must be in effect — bump so the UI doesn't show
+/// nonsense like 145%.
+pub fn context_limit_observed(model: Option<&str>, observed_tokens: u64) -> u64 {
+    let static_limit = model
+        .map(context_limit_for)
+        .unwrap_or(DEFAULT_CONTEXT_LIMIT);
+    if observed_tokens > static_limit
+        && model.map(supports_1m_context).unwrap_or(false)
+    {
+        return EXTENDED_CONTEXT_LIMIT;
+    }
+    static_limit
 }

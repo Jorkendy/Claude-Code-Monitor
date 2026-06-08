@@ -53,10 +53,14 @@
   };
 
   type Plan = "api" | "pro" | "max-5x" | "max-20x";
+  type Theme = "system" | "light" | "dark";
   type Settings = {
     budget_window_usd: number;
     plan: Plan;
     rate_limit_warn_pct: number;
+    custom_quota: number | null;
+    theme: Theme;
+    first_run: boolean;
   };
   type Tab = "sessions" | "blocks" | "settings";
 
@@ -81,6 +85,9 @@
     budget_window_usd: 0,
     plan: "api",
     rate_limit_warn_pct: 90,
+    custom_quota: null,
+    theme: "system",
+    first_run: true,
   });
   let loading = $state(true);
   let error: string | null = $state(null);
@@ -193,8 +200,14 @@
   });
   const heroRemaining = $derived(heroBlock ? heroBlock.end_ms - now : 0);
 
-  // Subscription-mode derivations.
-  const quota = $derived(QUOTA[settings.plan]);
+  // Subscription-mode derivations. Custom quota (when set) overrides the
+  // community estimate, matching backend `effective_quota`.
+  const baseQuota = $derived(QUOTA[settings.plan]);
+  const quota = $derived(
+    baseQuota != null && settings.custom_quota && settings.custom_quota > 0
+      ? settings.custom_quota
+      : baseQuota,
+  );
   const isSubs = $derived(quota != null);
   const quotaPct = $derived.by(() => {
     if (!heroBlock || quota == null || quota === 0) return 0;
@@ -222,9 +235,94 @@
   const heroBarColor = $derived(
     isSubs ? `var(--ts-tier-${quotaTier})` : "var(--ts-accent)",
   );
+
+  // --- theme ---
+  // `system` clears data-theme so tokens.css's prefers-color-scheme rule
+  // wins; explicit values pin the override.
+  $effect(() => {
+    const root = document.documentElement;
+    if (settings.theme === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", settings.theme);
+  });
+
+  // --- first-run modal ---
+  let showFirstRun = $state(false);
+  $effect(() => {
+    if (!loading && settings.first_run) showFirstRun = true;
+  });
+  async function pickFirstRunPlan(p: Plan) {
+    settings.plan = p;
+    settings.first_run = false;
+    showFirstRun = false;
+    await saveSettings();
+  }
+
+  // --- keyboard shortcuts ---
+  // Skip when an input/textarea is focused so users can still type numbers
+  // into the Settings inputs.
+  function handleKey(e: KeyboardEvent) {
+    const t = e.target as HTMLElement | null;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+    if (showFirstRun) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    switch (e.key) {
+      case "1": tab = "sessions"; break;
+      case "2": tab = "blocks"; break;
+      case "3": tab = "settings"; break;
+      case "r": case "R": load(false); break;
+      case "d": case "D": openDashboard(); break;
+      case "Escape": {
+        if (expandedId) { expandedId = null; break; }
+        // No window.close in Tauri webview; emulate dismiss by blurring.
+        (document.activeElement as HTMLElement | null)?.blur();
+        break;
+      }
+      default: return;
+    }
+    e.preventDefault();
+  }
 </script>
 
+<svelte:window onkeydown={handleKey} />
+
 <div class="ts-popover" data-popover-root>
+  {#if showFirstRun}
+    <div class="ts-firstrun-scrim" role="presentation">
+      <div
+        class="ts-firstrun"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="firstrun-title"
+      >
+        <div class="ts-firstrun-title" id="firstrun-title">
+          Welcome to Tokenscope
+        </div>
+        <div class="ts-firstrun-sub">
+          Pick how you pay so the numbers mean what you expect.
+        </div>
+        <div class="ts-firstrun-plans">
+          {#each ["api", "pro", "max-5x", "max-20x"] as const as p}
+            <button
+              class="ts-firstrun-plan"
+              onclick={() => pickFirstRunPlan(p)}
+            >
+              <div class="ts-firstrun-plan-name">{PLAN_LABEL[p]}</div>
+              <div class="ts-firstrun-plan-desc">
+                {#if p === "api"}
+                  Per-token cost via API
+                {:else}
+                  ~{QUOTA[p]} msgs / 5h window
+                {/if}
+              </div>
+            </button>
+          {/each}
+        </div>
+        <div class="ts-firstrun-foot">
+          You can change this any time in Settings.
+        </div>
+      </div>
+    </div>
+  {/if}
   {#if heroBlock}
     {@const burnHot = heroBlock.burn_usd_per_hr >= 0.5}
     {@const rateHot = isSubs ? quotaPct >= 50 : burnHot}
@@ -648,6 +746,29 @@
               <span class="ts-mono">0</span> disables alerts.
             </div>
           </div>
+
+          <div class="ts-set-field">
+            <label class="ts-set-label" for="quota-input"
+              >Custom quota</label
+            >
+            <div class="ts-set-inputrow">
+              <input
+                id="quota-input"
+                class="ts-set-input ts-tnum"
+                type="number"
+                min="0"
+                step="5"
+                placeholder={String(baseQuota ?? 0)}
+                bind:value={settings.custom_quota}
+                onchange={saveSettings}
+              />
+              <span class="ts-set-suffix">msgs / 5h</span>
+            </div>
+            <div class="ts-set-hint">
+              Override the community estimate ({baseQuota} for {PLAN_LABEL[settings.plan]})
+              with your measured limit. <span class="ts-mono">0</span> or empty falls back to default.
+            </div>
+          </div>
         {:else}
           <div class="ts-set-field">
             <label class="ts-set-label" for="budget-input"
@@ -674,6 +795,42 @@
         {/if}
 
         <div class="ts-set-divider"></div>
+
+        <div class="ts-set-field">
+          <div class="ts-set-label">Appearance</div>
+          <div class="ts-plan-seg">
+            {#each ["system", "light", "dark"] as const as t}
+              <button
+                class="ts-plan-opt"
+                class:is-on={settings.theme === t}
+                onclick={() => {
+                  settings.theme = t;
+                  saveSettings();
+                }}
+              >
+                {t === "system" ? "System" : t === "light" ? "Light" : "Dark"}
+              </button>
+            {/each}
+          </div>
+          <div class="ts-set-hint">
+            <span class="ts-mono">System</span> follows your macOS appearance.
+          </div>
+        </div>
+
+        <div class="ts-set-divider"></div>
+
+        <div class="ts-set-note">
+          <Icon name="keyboard" size={14} />
+          <div>
+            <div class="ts-set-note-k">Shortcuts</div>
+            <div class="ts-set-note-v">
+              <span class="ts-mono">1</span>/<span class="ts-mono">2</span>/<span class="ts-mono">3</span>
+              tabs · <span class="ts-mono">R</span> refresh ·
+              <span class="ts-mono">D</span> dashboard ·
+              <span class="ts-mono">Esc</span> collapse
+            </div>
+          </div>
+        </div>
 
         <div class="ts-set-note">
           <Icon name="folder" size={14} />
@@ -1405,5 +1562,72 @@
     color: var(--ts-text-1);
     font-weight: 550;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  }
+
+  /* first-run modal */
+  .ts-firstrun-scrim {
+    position: absolute;
+    inset: 0;
+    background: var(--ts-scrim);
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .ts-firstrun {
+    width: 100%;
+    background: var(--ts-bg-content);
+    border: 1px solid var(--ts-border);
+    border-radius: var(--ts-r-xl);
+    padding: 18px 18px 14px;
+    box-shadow: var(--ts-pop-shadow);
+  }
+  .ts-firstrun-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--ts-text-1);
+  }
+  .ts-firstrun-sub {
+    font-size: 12px;
+    color: var(--ts-text-2);
+    margin-top: 4px;
+    margin-bottom: 12px;
+  }
+  .ts-firstrun-plans {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+  .ts-firstrun-plan {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    text-align: left;
+    background: var(--ts-surface-2);
+    border: 1px solid var(--ts-border);
+    border-radius: var(--ts-r-md);
+    padding: 10px 12px;
+    color: var(--ts-text-1);
+    cursor: pointer;
+  }
+  .ts-firstrun-plan:hover {
+    background: var(--ts-surface);
+    border-color: var(--ts-accent-line);
+  }
+  .ts-firstrun-plan-name {
+    font-weight: 600;
+    font-size: 13px;
+  }
+  .ts-firstrun-plan-desc {
+    font-size: 11px;
+    color: var(--ts-text-3);
+    margin-top: 2px;
+  }
+  .ts-firstrun-foot {
+    margin-top: 12px;
+    font-size: 11px;
+    color: var(--ts-text-3);
+    text-align: center;
   }
 </style>

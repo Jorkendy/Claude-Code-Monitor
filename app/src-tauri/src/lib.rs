@@ -28,6 +28,19 @@ struct Settings {
     /// Used only for subscription plans. 0 disables.
     #[serde(default = "default_rate_warn")]
     rate_limit_warn_pct: f64,
+    /// User-supplied quota override (messages per 5h window). Anthropic
+    /// doesn't publish exact numbers; this lets a user lock in what they've
+    /// actually measured. Subscription plans only.
+    #[serde(default)]
+    custom_quota: Option<u64>,
+    /// "system" | "light" | "dark". `system` follows OS via the existing
+    /// `prefers-color-scheme` rules in tokens.css.
+    #[serde(default = "default_theme")]
+    theme: String,
+    /// True until the user has explicitly picked a plan. Drives the
+    /// first-run modal.
+    #[serde(default = "default_true")]
+    first_run: bool,
 }
 
 fn default_plan() -> String {
@@ -36,6 +49,12 @@ fn default_plan() -> String {
 fn default_rate_warn() -> f64 {
     90.0
 }
+fn default_theme() -> String {
+    "system".to_string()
+}
+fn default_true() -> bool {
+    true
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -43,6 +62,9 @@ impl Default for Settings {
             budget_window_usd: 5.0,
             plan: default_plan(),
             rate_limit_warn_pct: default_rate_warn(),
+            custom_quota: None,
+            theme: default_theme(),
+            first_run: true,
         }
     }
 }
@@ -56,6 +78,13 @@ fn quota_for(plan: &str) -> Option<u64> {
         "max-20x" => Some(900),
         _ => None,
     }
+}
+
+/// Effective quota: user override wins over the community estimate when set.
+/// Returns None for "api" (no quota; cost-based).
+fn effective_quota(s: &Settings) -> Option<u64> {
+    let base = quota_for(&s.plan)?;
+    Some(s.custom_quota.filter(|&q| q > 0).unwrap_or(base))
 }
 
 fn settings_path(app: &AppHandle) -> Option<std::path::PathBuf> {
@@ -142,6 +171,9 @@ fn set_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     let path = settings_path(&app).ok_or("no config dir")?;
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    // Notify other windows so the dashboard picks up theme / plan changes
+    // without waiting for the next filesystem-watcher tick.
+    let _ = app.emit("data-changed", ());
     Ok(())
 }
 
@@ -459,7 +491,7 @@ struct TrayState {
 fn tray_state(app: &AppHandle) -> TrayState {
     let snap = active_snapshot();
     let settings = load_settings(app);
-    let quota = quota_for(&settings.plan);
+    let quota = effective_quota(&settings);
 
     let base = if let Some(q) = quota {
         let pct = if q > 0 {
@@ -571,7 +603,7 @@ fn check_budget(app: &AppHandle) {
         }
     }
 
-    if let Some(q) = quota_for(&settings.plan) {
+    if let Some(q) = effective_quota(&settings) {
         // Subscription plan: rate-limit warning at % of estimated quota.
         if settings.rate_limit_warn_pct <= 0.0 || q == 0 {
             eprintln!("[alert] rate-limit disabled (threshold=0)");

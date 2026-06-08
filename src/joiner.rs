@@ -111,11 +111,10 @@ pub fn join(scan: &ScanResult, cache: &mut CacheFile) -> Result<Vec<SessionRow>>
         .into_iter()
         .map(|(session_id, p)| {
             let status = liveness::classify(p.pid, p.status_field.as_deref());
-            let context_limit = p
-                .model
-                .as_deref()
-                .map(crate::pricing::context_limit_for)
-                .unwrap_or(crate::pricing::DEFAULT_CONTEXT_LIMIT);
+            let context_limit = crate::pricing::context_limit_observed(
+                p.model.as_deref(),
+                p.context_tokens,
+            );
             SessionRow {
                 session_id,
                 name: p.name,
