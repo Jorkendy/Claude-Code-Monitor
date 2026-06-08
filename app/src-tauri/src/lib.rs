@@ -271,6 +271,21 @@ fn unhide_all(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// Drops hidden ids whose backing session is gone. Caller passes the current
+// alive session id list; we keep only the intersection. No emit — caller
+// already has fresh data and would double-load on data-changed.
+#[tauri::command]
+fn prune_hidden(app: AppHandle, alive_ids: Vec<String>) -> Result<(), String> {
+    let mut h = load_hidden(&app);
+    let alive: std::collections::HashSet<String> = alive_ids.into_iter().collect();
+    let before = h.ids.len();
+    h.ids.retain(|id| alive.contains(id));
+    if h.ids.len() != before {
+        save_hidden(&app, &h)?;
+    }
+    Ok(())
+}
+
 // ---- Hard delete -------------------------------------------------------
 //
 // Only inactive sessions can be hard-deleted — we refuse on active/idle to
@@ -1027,6 +1042,7 @@ pub fn run() {
             hide_session,
             unhide_session,
             unhide_all,
+            prune_hidden,
             delete_session_files,
             list_repo_rollups,
             open_dashboard,

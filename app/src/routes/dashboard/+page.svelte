@@ -110,8 +110,17 @@
       ]);
       sessions = s;
       repos = r;
-      hidden = new Set(h);
       settings = st;
+      // Drop hidden ids whose session is gone, so the badge counter and the
+      // file on disk don't slowly fill with ghosts.
+      const aliveIds = s.map((x) => x.session_id);
+      const aliveSet = new Set(aliveIds);
+      if (h.some((id) => !aliveSet.has(id))) {
+        await invoke("prune_hidden", { aliveIds });
+        hidden = new Set(h.filter((id) => aliveSet.has(id)));
+      } else {
+        hidden = new Set(h);
+      }
     } catch (e) {
       error = String(e);
     } finally {
