@@ -49,6 +49,11 @@ pub struct SessionRow {
     /// Filled by the CLI after join, using the pricing table. None when
     /// the model is unknown / synthetic / has no transcript data.
     pub cost_usd: Option<f64>,
+    /// Context window currently in use (prompt size at the latest assistant
+    /// turn). 0 when no real-model events were seen.
+    pub context_tokens: u64,
+    /// Context window limit for `model`. Defaults to 200K when model unknown.
+    pub context_limit: u64,
 }
 
 /// A single assistant-message-with-usage event. Used for time-based

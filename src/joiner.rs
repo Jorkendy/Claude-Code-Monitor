@@ -37,6 +37,8 @@ struct Partial {
     subagent_count: usize,
     model: Option<String>,
     updated_at_ms: Option<i64>,
+    context_tokens: u64,
+    context_ts_ms: i64,
 }
 
 pub fn join(scan: &ScanResult, cache: &mut CacheFile) -> Result<Vec<SessionRow>> {
@@ -64,6 +66,12 @@ pub fn join(scan: &ScanResult, cache: &mut CacheFile) -> Result<Vec<SessionRow>>
         entry.tokens.add(&s.tokens);
         if let Some(m) = s.model {
             entry.model = Some(m);
+        }
+        // Context comes from the main transcript only (subagent transcripts
+        // are separate conversations with their own context windows).
+        if s.latest_ts_ms >= entry.context_ts_ms {
+            entry.context_ts_ms = s.latest_ts_ms;
+            entry.context_tokens = s.latest_context_tokens;
         }
         if entry.cwd.is_none() {
             if let Some(slug) = p
@@ -96,6 +104,11 @@ pub fn join(scan: &ScanResult, cache: &mut CacheFile) -> Result<Vec<SessionRow>>
         .into_iter()
         .map(|(session_id, p)| {
             let status = liveness::classify(p.pid, p.status_field.as_deref());
+            let context_limit = p
+                .model
+                .as_deref()
+                .map(crate::pricing::context_limit_for)
+                .unwrap_or(crate::pricing::DEFAULT_CONTEXT_LIMIT);
             SessionRow {
                 session_id,
                 name: p.name,
@@ -108,6 +121,8 @@ pub fn join(scan: &ScanResult, cache: &mut CacheFile) -> Result<Vec<SessionRow>>
                 model: p.model,
                 updated_at_ms: p.updated_at_ms,
                 cost_usd: None,
+                context_tokens: p.context_tokens,
+                context_limit,
             }
         })
         .collect();

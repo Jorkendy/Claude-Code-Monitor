@@ -22,6 +22,14 @@ pub struct JsonlSummary {
     pub model: Option<String>,
     /// Bytes consumed so far — used by the cache for incremental resume.
     pub byte_offset: u64,
+    /// Context window usage = `input + cache_read + cache_creation` of the
+    /// latest non-synthetic assistant turn. Each turn re-sends the full
+    /// history (or post-compaction summary), so this is the prompt size at
+    /// the most recent turn — i.e., how full the context is right now.
+    pub latest_context_tokens: u64,
+    /// Timestamp (ms) of the event that contributed `latest_context_tokens`.
+    /// Used to pick the winner when merging incremental parses.
+    pub latest_ts_ms: i64,
 }
 
 const NEEDLE: &[u8] = b"\"usage\"";
@@ -43,6 +51,8 @@ pub fn sum_jsonl(path: &Path, resume_from_offset: u64) -> Result<JsonlSummary> {
         tokens: Tokens::default(),
         model: None,
         byte_offset: start,
+        latest_context_tokens: 0,
+        latest_ts_ms: 0,
     };
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     loop {
@@ -67,20 +77,38 @@ pub fn sum_jsonl(path: &Path, resume_from_offset: u64) -> Result<JsonlSummary> {
         let Some(usage) = value.pointer("/message/usage") else {
             continue;
         };
+        let event_input = as_u64(usage.get("input_tokens"));
+        let event_output = as_u64(usage.get("output_tokens"));
+        let event_cache_creation = as_u64(usage.get("cache_creation_input_tokens"));
+        let event_cache_read = as_u64(usage.get("cache_read_input_tokens"));
         let t = &mut summary.tokens;
-        t.input += as_u64(usage.get("input_tokens"));
-        t.output += as_u64(usage.get("output_tokens"));
-        t.cache_creation += as_u64(usage.get("cache_creation_input_tokens"));
-        t.cache_read += as_u64(usage.get("cache_read_input_tokens"));
+        t.input += event_input;
+        t.output += event_output;
+        t.cache_creation += event_cache_creation;
+        t.cache_read += event_cache_read;
         // Skip "<synthetic>" — Claude Code's marker for compaction summaries
         // and similar messages it generates internally (not a real model call).
         // Keep the most recent REAL model so cost lookup works.
-        if let Some(m) = value
+        let real_model = value
             .pointer("/message/model")
             .and_then(|v| v.as_str())
-            .filter(|m| *m != "<synthetic>")
-        {
+            .filter(|m| *m != "<synthetic>");
+        if let Some(m) = real_model {
             summary.model = Some(m.to_string());
+        }
+        // Track context window usage: only real model events (not synthetic
+        // compaction markers) define the live context size.
+        if real_model.is_some() {
+            if let Some(ts_str) = value.get("timestamp").and_then(|t| t.as_str()) {
+                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                    let ts_ms = ts.timestamp_millis();
+                    if ts_ms >= summary.latest_ts_ms {
+                        summary.latest_ts_ms = ts_ms;
+                        summary.latest_context_tokens =
+                            event_input + event_cache_read + event_cache_creation;
+                    }
+                }
+            }
         }
     }
     Ok(summary)

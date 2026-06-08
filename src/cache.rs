@@ -27,6 +27,13 @@ pub struct FileEntry {
     pub byte_offset: u64,
     pub tokens: Tokens,
     pub model: Option<String>,
+    /// Latest non-synthetic event's prompt size (context window usage).
+    /// `#[serde(default)]` lets old caches still load — they'll be re-parsed
+    /// on next file change since size/mtime match-only path also needs these.
+    #[serde(default)]
+    pub latest_context_tokens: u64,
+    #[serde(default)]
+    pub latest_ts_ms: i64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -64,6 +71,8 @@ pub fn cached_sum(path: &Path, cache: &mut CacheFile) -> Result<JsonlSummary> {
                 tokens: prev.tokens,
                 model: prev.model,
                 byte_offset: prev.byte_offset,
+                latest_context_tokens: prev.latest_context_tokens,
+                latest_ts_ms: prev.latest_ts_ms,
             });
         }
         if size > prev.size {
@@ -71,6 +80,12 @@ pub fn cached_sum(path: &Path, cache: &mut CacheFile) -> Result<JsonlSummary> {
             new.tokens.add(&prev.tokens);
             if new.model.is_none() {
                 new.model = prev.model;
+            }
+            // Latest-event wins: the appended portion only updates context if
+            // its newest event is at least as recent as the prior one.
+            if prev.latest_ts_ms > new.latest_ts_ms {
+                new.latest_ts_ms = prev.latest_ts_ms;
+                new.latest_context_tokens = prev.latest_context_tokens;
             }
             cache.files.insert(
                 path.to_path_buf(),
@@ -80,6 +95,8 @@ pub fn cached_sum(path: &Path, cache: &mut CacheFile) -> Result<JsonlSummary> {
                     byte_offset: new.byte_offset,
                     tokens: new.tokens,
                     model: new.model.clone(),
+                    latest_context_tokens: new.latest_context_tokens,
+                    latest_ts_ms: new.latest_ts_ms,
                 },
             );
             return Ok(new);
@@ -95,6 +112,8 @@ pub fn cached_sum(path: &Path, cache: &mut CacheFile) -> Result<JsonlSummary> {
             byte_offset: summary.byte_offset,
             tokens: summary.tokens,
             model: summary.model.clone(),
+            latest_context_tokens: summary.latest_context_tokens,
+            latest_ts_ms: summary.latest_ts_ms,
         },
     );
     Ok(summary)

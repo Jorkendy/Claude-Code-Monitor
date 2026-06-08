@@ -7,6 +7,7 @@ use cc_monitor::{api, blocks::SessionBlock, model::SessionRow};
 use serde::{Deserialize, Serialize};
 use tauri::{
     ActivationPolicy, AppHandle, Manager, PhysicalPosition, WindowEvent,
+    image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
@@ -53,6 +54,54 @@ fn list_blocks() -> Result<Vec<SessionBlock>, String> {
     api::list_blocks(None).map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct BlockView {
+    #[serde(flatten)]
+    block: SessionBlock,
+    /// Cost computed from first non-empty model in the block. Matches
+    /// the CLI's `block_cost` heuristic in renderer.rs.
+    cost_usd: f64,
+    /// Rolling burn rate in USD/hr (last 10 min). Set for the active block
+    /// only; 0 for done blocks.
+    burn_usd_per_hr: f64,
+    /// `current cost + burn × hours-until-block-reset`. Active block only.
+    projected_block_usd: f64,
+}
+
+#[tauri::command]
+fn list_block_views() -> Result<Vec<BlockView>, String> {
+    let enriched = api::list_blocks_enriched(None).map_err(|e| e.to_string())?;
+    let table = cc_monitor::pricing::load();
+    Ok(enriched
+        .blocks
+        .into_iter()
+        .map(|b| {
+            let cost = b
+                .models
+                .iter()
+                .find(|m| !m.is_empty())
+                .and_then(|m| cc_monitor::pricing::lookup(&table, m))
+                .map(|p| cc_monitor::pricing::cost_usd(p, &b.tokens))
+                .unwrap_or(0.0);
+            let (burn, projected) = if b.is_active {
+                enriched
+                    .active
+                    .as_ref()
+                    .map(|a| (a.burn_usd_per_hr, a.projected_block_usd))
+                    .unwrap_or((0.0, cost))
+            } else {
+                (0.0, 0.0)
+            };
+            BlockView {
+                block: b,
+                cost_usd: cost,
+                burn_usd_per_hr: burn,
+                projected_block_usd: projected,
+            }
+        })
+        .collect())
+}
+
 #[tauri::command]
 fn get_settings(app: AppHandle) -> Settings {
     load_settings(&app)
@@ -66,21 +115,14 @@ fn set_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     Ok(())
 }
 
-fn active_block_cost() -> Option<f64> {
-    api::list_blocks(None)
-        .ok()?
-        .into_iter()
-        .find(|b| b.is_active)
-        .and_then(|b| {
-            let model = b.models.first().cloned()?;
-            let table = cc_monitor::pricing::load();
-            let p = cc_monitor::pricing::lookup(&table, &model)?;
-            Some(cc_monitor::pricing::cost_usd(p, &b.tokens))
-        })
+fn active_burn() -> Option<api::ActiveBurn> {
+    api::list_blocks_enriched(None).ok()?.active
 }
 
 fn tray_title() -> String {
-    let cost = active_block_cost().unwrap_or(0.0);
+    let burn = active_burn();
+    let cost = burn.as_ref().map(|a| a.current_usd).unwrap_or(0.0);
+    let rate = burn.as_ref().map(|a| a.burn_usd_per_hr).unwrap_or(0.0);
     let live = api::list_sessions(None)
         .map(|rows| {
             rows.iter()
@@ -93,7 +135,12 @@ fn tray_title() -> String {
                 .count()
         })
         .unwrap_or(0);
-    format!("${cost:.2} · {live} live")
+    // Only show $/hr when meaningful — sub-$0.50/hr is just noise.
+    if rate >= 0.5 {
+        format!("${cost:.2} · ${rate:.0}/hr · {live} live")
+    } else {
+        format!("${cost:.2} · {live} live")
+    }
 }
 
 fn refresh_tray(app: &AppHandle) {
@@ -106,6 +153,9 @@ fn refresh_tray(app: &AppHandle) {
 // below the threshold (or 1h passes, as a safety reset for long sessions).
 static LAST_ALERT: Mutex<Option<Instant>> = Mutex::new(None);
 static ALERT_FIRED_FOR_CURRENT_CROSSING: Mutex<bool> = Mutex::new(false);
+// Proactive projection alert: at most one per block. Keyed by block.start_ms
+// so we re-arm when the 5h window rolls over.
+static PROJ_ALERTED_BLOCK_START: Mutex<Option<i64>> = Mutex::new(None);
 
 fn check_budget(app: &AppHandle) {
     let settings = load_settings(app);
@@ -113,14 +163,41 @@ fn check_budget(app: &AppHandle) {
         eprintln!("[budget] disabled (threshold=0)");
         return;
     }
-    let Some(cost) = active_block_cost() else {
+    let Some(burn) = active_burn() else {
         eprintln!("[budget] no active block");
         return;
     };
+    let cost = burn.current_usd;
+    let projected = burn.projected_block_usd;
     eprintln!(
-        "[budget] cost=${cost:.2} threshold=${:.2}",
+        "[budget] cost=${cost:.2} proj=${projected:.2} threshold=${:.2}",
         settings.budget_window_usd
     );
+    // Re-arm projection alert when block boundary changes.
+    {
+        let mut last_block = PROJ_ALERTED_BLOCK_START.lock().unwrap();
+        if *last_block != Some(burn.block_start_ms) {
+            *last_block = None;
+        }
+    }
+    // Proactive: projected to cross but actual hasn't yet → tell user once
+    // per block, so they can pause before they're surprised.
+    if projected >= settings.budget_window_usd && cost < settings.budget_window_usd {
+        let mut last_block = PROJ_ALERTED_BLOCK_START.lock().unwrap();
+        if *last_block != Some(burn.block_start_ms) {
+            let res = app
+                .notification()
+                .builder()
+                .title("cc-monitor — projected over budget")
+                .body(format!(
+                    "Block trending to ${projected:.2} by reset (threshold ${:.2}, burn ${:.0}/hr)",
+                    settings.budget_window_usd, burn.burn_usd_per_hr
+                ))
+                .show();
+            eprintln!("[budget] projection notification => {res:?}");
+            *last_block = Some(burn.block_start_ms);
+        }
+    }
     let mut fired = ALERT_FIRED_FOR_CURRENT_CROSSING.lock().unwrap();
     let mut last = LAST_ALERT.lock().unwrap();
     if cost < settings.budget_window_usd {
@@ -171,10 +248,10 @@ pub fn run() {
             let quit = MenuItem::with_id(app, "quit", "Quit cc-monitor", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
 
-            let icon = app
-                .default_window_icon()
-                .cloned()
-                .ok_or("missing default window icon")?;
+            // Custom monochrome "C" icon for the menubar, rendered as a
+            // macOS template image so the system tints it for light/dark
+            // menubar. Bundled into the binary so no runtime path lookup.
+            let icon = Image::from_bytes(include_bytes!("../icons/tray/tray@2x.png"))?;
 
             TrayIconBuilder::with_id("main")
                 .icon(icon)
@@ -215,15 +292,30 @@ pub fn run() {
 
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
                 let _ = window.hide();
                 api.prevent_close();
             }
+            // Menubar UX: clicking anywhere outside the popover dismisses it.
+            // 200ms debounce so transient focus losses (notifications, tray
+            // re-toggle) don't accidentally dismiss it — if the window regains
+            // focus before the timer fires, we skip the hide.
+            WindowEvent::Focused(false) => {
+                let window = window.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    if !window.is_focused().unwrap_or(true) {
+                        let _ = window.hide();
+                    }
+                });
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             list_blocks,
+            list_block_views,
             get_settings,
             set_settings,
         ])

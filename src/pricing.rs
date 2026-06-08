@@ -120,3 +120,13 @@ pub fn cost_usd(p: &ModelPricing, t: &Tokens) -> f64 {
         + t.cache_read as f64 * p.cache_read)
         / 1_000_000.0
 }
+
+/// Context window limit by model. All current Claude models are 200K. The
+/// 1M-token Opus variant is opt-in via API header and currently has no
+/// distinct model id in `~/.claude` data, so we treat 200K as the safe
+/// default. If we ever surface 1M sessions, add a per-model override here.
+pub const DEFAULT_CONTEXT_LIMIT: u64 = 200_000;
+
+pub fn context_limit_for(_model: &str) -> u64 {
+    DEFAULT_CONTEXT_LIMIT
+}
