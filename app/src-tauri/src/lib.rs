@@ -387,33 +387,86 @@ fn active_burn() -> Option<api::ActiveBurn> {
     api::list_blocks_enriched(None).ok()?.active
 }
 
-fn tray_title() -> String {
+struct TrayState {
+    title: String,
+    tooltip: Option<String>,
+}
+
+// Minimal + alert breakthrough per design spec:
+//   `$cost · $burn/hr` (burn hidden when < 0.5/hr → just `$cost`)
+//   Prepend `⚠` when:
+//     critical: any active/idle session at ≥ 90% context
+//     warning:  budget > 0 and projected ≥ budget
+//   Critical wins over warning. Tooltip names the cause.
+fn tray_state(app: &AppHandle) -> TrayState {
     let burn = active_burn();
     let cost = burn.as_ref().map(|a| a.current_usd).unwrap_or(0.0);
     let rate = burn.as_ref().map(|a| a.burn_usd_per_hr).unwrap_or(0.0);
-    let live = api::list_sessions(None)
-        .map(|rows| {
-            rows.iter()
-                .filter(|r| {
-                    matches!(
-                        r.status,
-                        tokenscope::model::LiveStatus::Active | tokenscope::model::LiveStatus::Idle
-                    )
-                })
-                .count()
-        })
-        .unwrap_or(0);
-    // Only show $/hr when meaningful — sub-$0.50/hr is just noise.
-    if rate >= 0.5 {
-        format!("${cost:.2} · ${rate:.0}/hr · {live} live")
+    let projected = burn.as_ref().map(|a| a.projected_block_usd).unwrap_or(0.0);
+
+    let base = if rate >= 0.5 {
+        format!("${cost:.2} · ${rate:.2}/hr")
     } else {
-        format!("${cost:.2} · {live} live")
+        format!("${cost:.2}")
+    };
+
+    // Critical: any live session ≥ 90% context.
+    let sessions = api::list_sessions(None).unwrap_or_default();
+    let worst = sessions
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.status,
+                tokenscope::model::LiveStatus::Active | tokenscope::model::LiveStatus::Idle
+            )
+        })
+        .filter_map(|s| {
+            if s.context_limit == 0 {
+                return None;
+            }
+            let pct = s.context_tokens as f64 / s.context_limit as f64;
+            Some((pct, s))
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if let Some((pct, s)) = worst {
+        if pct >= 0.90 {
+            let name = s
+                .name
+                .clone()
+                .unwrap_or_else(|| s.session_id.chars().take(8).collect());
+            return TrayState {
+                title: format!("⚠ {base}"),
+                tooltip: Some(format!(
+                    "{name} — context {}%",
+                    (pct * 100.0).round() as i64
+                )),
+            };
+        }
+    }
+
+    let settings = load_settings(app);
+    if settings.budget_window_usd > 0.0 && projected >= settings.budget_window_usd {
+        return TrayState {
+            title: format!("⚠ {base}"),
+            tooltip: Some(format!(
+                "projected ${projected:.2} ≥ ${:.2} budget",
+                settings.budget_window_usd
+            )),
+        };
+    }
+
+    TrayState {
+        title: base,
+        tooltip: None,
     }
 }
 
 fn refresh_tray(app: &AppHandle) {
     if let Some(tray) = app.tray_by_id("main") {
-        let _ = tray.set_title(Some(tray_title()));
+        let state = tray_state(app);
+        let _ = tray.set_title(Some(state.title));
+        let _ = tray.set_tooltip(state.tooltip);
     }
 }
 
@@ -516,15 +569,15 @@ pub fn run() {
             let quit = MenuItem::with_id(app, "quit", "Quit Tokenscope", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
 
-            // Custom monochrome "C" icon for the menubar, rendered as a
-            // macOS template image so the system tints it for light/dark
-            // menubar. Bundled into the binary so no runtime path lookup.
+            // 3-bar ascending bar-chart, rendered as a macOS template image so
+            // the system tints it for light/dark menubar.
             let icon = Image::from_bytes(include_bytes!("../icons/tray/tray@2x.png"))?;
 
-            TrayIconBuilder::with_id("main")
+            let initial = tray_state(&app.handle());
+            let tray = TrayIconBuilder::with_id("main")
                 .icon(icon)
                 .icon_as_template(true)
-                .title(tray_title())
+                .title(initial.title)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
@@ -544,6 +597,7 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+            let _ = tray.set_tooltip(initial.tooltip);
 
             // Force registration with the macOS Notification Center.
             ensure_notification_permission(&app.handle());

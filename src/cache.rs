@@ -19,7 +19,10 @@ use std::time::UNIX_EPOCH;
 use crate::model::Tokens;
 use crate::parser::{self, JsonlSummary};
 
-const CACHE_FILE: &str = ".tokenscope-cache.json";
+// Schema-versioned filename: bumping invalidates old caches without an
+// explicit migration step. v1 lacked `latest_name`, which left inactive
+// sessions nameless because size+mtime always match for closed transcripts.
+const CACHE_FILE: &str = ".tokenscope-cache-v2.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -35,6 +38,11 @@ pub struct FileEntry {
     pub latest_context_tokens: u64,
     #[serde(default)]
     pub latest_ts_ms: i64,
+    /// Last-seen `customTitle` for this transcript. Survives session exit
+    /// (Claude Code removes `sessions/{pid}.json` on exit but keeps the
+    /// JSONL), giving us a stable name for inactive sessions.
+    #[serde(default)]
+    pub latest_name: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -74,19 +82,25 @@ pub fn cached_sum(path: &Path, cache: &mut CacheFile) -> Result<JsonlSummary> {
                 byte_offset: prev.byte_offset,
                 latest_context_tokens: prev.latest_context_tokens,
                 latest_ts_ms: prev.latest_ts_ms,
+                latest_name: prev.latest_name,
             });
         }
         if size > prev.size {
             let mut new = parser::sum_jsonl(path, prev.byte_offset)?;
             new.tokens.add(&prev.tokens);
             if new.model.is_none() {
-                new.model = prev.model;
+                new.model = prev.model.clone();
             }
             // Latest-event wins: the appended portion only updates context if
             // its newest event is at least as recent as the prior one.
             if prev.latest_ts_ms > new.latest_ts_ms {
                 new.latest_ts_ms = prev.latest_ts_ms;
                 new.latest_context_tokens = prev.latest_context_tokens;
+            }
+            // Name only appears once per /rename. Keep the prior cached name
+            // when the delta scan didn't see another custom-title event.
+            if new.latest_name.is_none() {
+                new.latest_name = prev.latest_name;
             }
             cache.files.insert(
                 path.to_path_buf(),
@@ -98,6 +112,7 @@ pub fn cached_sum(path: &Path, cache: &mut CacheFile) -> Result<JsonlSummary> {
                     model: new.model.clone(),
                     latest_context_tokens: new.latest_context_tokens,
                     latest_ts_ms: new.latest_ts_ms,
+                    latest_name: new.latest_name.clone(),
                 },
             );
             return Ok(new);
@@ -115,6 +130,7 @@ pub fn cached_sum(path: &Path, cache: &mut CacheFile) -> Result<JsonlSummary> {
             model: summary.model.clone(),
             latest_context_tokens: summary.latest_context_tokens,
             latest_ts_ms: summary.latest_ts_ms,
+            latest_name: summary.latest_name.clone(),
         },
     );
     Ok(summary)

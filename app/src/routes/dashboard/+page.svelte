@@ -2,13 +2,20 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
-
-  type Tokens = {
-    input: number;
-    output: number;
-    cache_creation: number;
-    cache_read: number;
-  };
+  import {
+    fmtUSD,
+    fmtTokensShort,
+    fmtTokensFull,
+    totalTokens,
+    fmtRelTime,
+    fmtModel,
+    contextTier,
+    repoName,
+    type Tokens,
+  } from "$lib/format";
+  import Icon from "$lib/components/Icon.svelte";
+  import StatusDot from "$lib/components/StatusDot.svelte";
+  import ContextBar from "$lib/components/ContextBar.svelte";
 
   type Session = {
     session_id: string;
@@ -30,42 +37,48 @@
     repo: string;
     session_count: number;
     live_count: number;
-    total_cost_usd: number;
     total_tokens: number;
+    total_cost_usd: number;
     top_model: string | null;
   };
 
-  type Tab = "sessions" | "repos";
-  type SortKey =
+  type View = "sessions" | "repos";
+  type StatusFilter = "all" | "active" | "idle" | "inactive";
+  type SessionSortKey =
     | "name"
     | "repo"
-    | "status"
-    | "tokens"
-    | "context"
-    | "cost"
     | "model"
-    | "updated";
+    | "context"
+    | "tokens"
+    | "cost_usd"
+    | "subagent_count"
+    | "updated_at_ms";
+  type RepoSortKey = keyof Repo;
   type SortDir = "asc" | "desc";
 
-  let tab: Tab = $state("sessions");
+  // --- state -----------------------------------------------------------
+  let view: View = $state("sessions");
   let sessions: Session[] = $state([]);
   let repos: Repo[] = $state([]);
   let hidden: Set<string> = $state(new Set());
   let loading = $state(true);
   let error: string | null = $state(null);
+  let now = $state(Date.now());
 
+  // sessions toolbar/sort state
   let search = $state("");
-  let statusFilter: "all" | "live" | "inactive" = $state("all");
+  let statusFilter: StatusFilter = $state("all");
   let repoFilter: string = $state("all");
   let showHidden = $state(false);
-  let sortKey: SortKey = $state("cost");
+  let sortKey: SessionSortKey = $state("updated_at_ms");
   let sortDir: SortDir = $state("desc");
-  let expandedId: string | null = $state(null);
-  let confirmDeleteId: string | null = $state(null);
+  let openId: string | null = $state(null);
+  let confirm: Session | null = $state(null);
 
-  // `loading` flips only on the initial mount load — subsequent refreshes
-  // (after hide/delete or watcher events) run in the background so the
-  // table doesn't unmount and the scroll position survives.
+  // repos sort state
+  let repoSortKey: RepoSortKey = $state("total_cost_usd");
+  let repoSortDir: SortDir = $state("desc");
+
   async function load(showSpinner = false) {
     try {
       if (showSpinner) loading = true;
@@ -85,26 +98,17 @@
     }
   }
 
-  async function hideSession(id: string) {
-    try {
-      // Optimistic: add to local hidden set immediately so the row either
-      // disappears (default view) or fades (show-hidden view) without a
-      // full re-render that would reset scroll.
-      hidden = new Set([...hidden, id]);
-      await invoke("hide_session", { sessionId: id });
-      await load();
-    } catch (e) {
-      error = String(e);
-      await load();
-    }
-  }
-
-  async function unhideSession(id: string) {
+  async function toggleHide(s: Session) {
+    const id = s.session_id;
+    const wasHidden = hidden.has(id);
     try {
       const next = new Set(hidden);
-      next.delete(id);
+      if (wasHidden) next.delete(id);
+      else next.add(id);
       hidden = next;
-      await invoke("unhide_session", { sessionId: id });
+      await invoke(wasHidden ? "unhide_session" : "hide_session", {
+        sessionId: id,
+      });
       await load();
     } catch (e) {
       error = String(e);
@@ -112,23 +116,11 @@
     }
   }
 
-  async function unhideAll() {
+  async function deleteSession(s: Session) {
     try {
-      hidden = new Set();
-      await invoke("unhide_all");
-      await load();
-    } catch (e) {
-      error = String(e);
-      await load();
-    }
-  }
-
-  async function deleteSession(id: string) {
-    try {
-      // Optimistic: drop the row from local state so it vanishes in place.
-      sessions = sessions.filter((s) => s.session_id !== id);
-      confirmDeleteId = null;
-      await invoke("delete_session_files", { sessionId: id });
+      sessions = sessions.filter((x) => x.session_id !== s.session_id);
+      confirm = null;
+      await invoke("delete_session_files", { sessionId: s.session_id });
       await load();
     } catch (e) {
       error = String(e);
@@ -137,634 +129,1146 @@
   }
 
   let unlisten: UnlistenFn | undefined;
+  let tickHandle: ReturnType<typeof setInterval> | undefined;
   onMount(async () => {
     await load(true);
-    unlisten = await listen("data-changed", () => load());
+    unlisten = await listen("data-changed", () => load(false));
+    tickHandle = setInterval(() => (now = Date.now()), 30_000);
   });
-  onDestroy(() => unlisten?.());
+  onDestroy(() => {
+    unlisten?.();
+    if (tickHandle) clearInterval(tickHandle);
+  });
 
-  function short(id: string): string {
-    return id.slice(0, 8);
-  }
+  // --- derived ---------------------------------------------------------
+  const repoOptions = $derived([
+    "all",
+    ...Array.from(new Set(sessions.map((s) => repoName(s.cwd)))).sort(),
+  ]);
 
-  function compact(n: number): string {
-    if (n < 1_000) return String(n);
-    if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}K`;
-    if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-    return `${(n / 1_000_000_000).toFixed(1)}B`;
-  }
-
-  function fmtCost(c: number | null): string {
-    if (c === null) return "N/A";
-    if (c === 0) return "—";
-    if (c < 0.01) return "<$0.01";
-    return `$${c.toFixed(2)}`;
-  }
-
-  function repoName(cwd: string | null): string {
-    if (!cwd) return "-";
-    const parts = cwd.split("/").filter(Boolean);
-    return parts[parts.length - 1] ?? "-";
-  }
-
-  function sessionTotal(s: Session): number {
-    return (
-      s.tokens.input +
-      s.tokens.output +
-      s.tokens.cache_creation +
-      s.subagent_tokens.input +
-      s.subagent_tokens.output +
-      s.subagent_tokens.cache_creation
-    );
-  }
-
-  function shortModel(m: string | null): string {
-    if (!m) return "-";
-    return m.replace(/^claude-/, "");
-  }
-
-  function ctxPct(s: Session): number {
-    if (!s.context_limit) return 0;
-    return Math.min(100, (s.context_tokens / s.context_limit) * 100);
-  }
-
-  function ctxColor(pct: number): string {
-    if (pct >= 90) return "#ef4444";
-    if (pct >= 75) return "#f97316";
-    if (pct >= 50) return "#facc15";
-    return "#4ade80";
-  }
-
-  function fmtDateTime(ms: number | null): string {
-    if (ms === null) return "—";
-    const d = new Date(ms);
-    return `${d.getMonth() + 1}/${d.getDate()} ${d
-      .toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })}`;
-  }
-
-  const allRepos = $derived(
-    Array.from(new Set(sessions.map((s) => repoName(s.cwd)))).sort(),
-  );
-
-  function statusMatch(s: Session): boolean {
-    if (statusFilter === "all") return true;
-    if (statusFilter === "live") return s.status === "active" || s.status === "idle";
-    return s.status === "inactive";
-  }
-
-  function searchMatch(s: Session): boolean {
-    if (!search.trim()) return true;
-    const q = search.trim().toLowerCase();
-    return (
-      (s.name?.toLowerCase().includes(q) ?? false) ||
-      s.session_id.toLowerCase().includes(q) ||
-      (s.cwd?.toLowerCase().includes(q) ?? false) ||
-      (s.model?.toLowerCase().includes(q) ?? false)
-    );
-  }
-
-  function hiddenMatch(s: Session): boolean {
-    return showHidden ? hidden.has(s.session_id) : !hidden.has(s.session_id);
-  }
-
-  function repoMatch(s: Session): boolean {
-    if (repoFilter === "all") return true;
-    return repoName(s.cwd) === repoFilter;
-  }
-
-  function compare(a: Session, b: Session): number {
-    let av: number | string;
-    let bv: number | string;
-    switch (sortKey) {
+  function sessionVal(s: Session, k: SessionSortKey): number | string {
+    switch (k) {
       case "name":
-        av = (a.name ?? a.session_id).toLowerCase();
-        bv = (b.name ?? b.session_id).toLowerCase();
-        break;
+        return (s.name || s.session_id).toLowerCase();
       case "repo":
-        av = repoName(a.cwd).toLowerCase();
-        bv = repoName(b.cwd).toLowerCase();
-        break;
-      case "status":
-        av = a.status;
-        bv = b.status;
-        break;
-      case "tokens":
-        av = sessionTotal(a);
-        bv = sessionTotal(b);
-        break;
-      case "context":
-        av = ctxPct(a);
-        bv = ctxPct(b);
-        break;
-      case "cost":
-        av = a.cost_usd ?? 0;
-        bv = b.cost_usd ?? 0;
-        break;
+        return repoName(s.cwd).toLowerCase();
       case "model":
-        av = (a.model ?? "").toLowerCase();
-        bv = (b.model ?? "").toLowerCase();
-        break;
-      case "updated":
-        av = a.updated_at_ms ?? 0;
-        bv = b.updated_at_ms ?? 0;
-        break;
+        return (s.model || "").toLowerCase();
+      case "context":
+        return s.context_tokens / s.context_limit;
+      case "tokens":
+        return totalTokens(s.tokens);
+      case "cost_usd":
+        return s.cost_usd ?? -1;
+      case "subagent_count":
+        return s.subagent_count;
+      case "updated_at_ms":
+        return s.updated_at_ms ?? 0;
     }
-    const cmp = av < bv ? -1 : av > bv ? 1 : a.session_id.localeCompare(b.session_id);
-    return sortDir === "desc" ? -cmp : cmp;
   }
 
-  const visible = $derived(
-    sessions
-      .filter(hiddenMatch)
-      .filter(statusMatch)
-      .filter(repoMatch)
-      .filter(searchMatch)
-      .slice()
-      .sort(compare),
+  const filteredSessions = $derived.by(() => {
+    let r = sessions.slice();
+    if (!showHidden) r = r.filter((s) => !hidden.has(s.session_id));
+    if (statusFilter !== "all") r = r.filter((s) => s.status === statusFilter);
+    if (repoFilter !== "all")
+      r = r.filter((s) => repoName(s.cwd) === repoFilter);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      r = r.filter(
+        (s) =>
+          (s.name || "").toLowerCase().includes(q) ||
+          s.session_id.toLowerCase().includes(q) ||
+          (s.cwd || "").toLowerCase().includes(q),
+      );
+    }
+    r.sort((a, b) => {
+      const av = sessionVal(a, sortKey);
+      const bv = sessionVal(b, sortKey);
+      const cmp =
+        typeof av === "string" && typeof bv === "string"
+          ? av.localeCompare(bv)
+          : (av as number) - (bv as number);
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return r;
+  });
+
+  const liveCount = $derived(
+    sessions.filter((s) => s.status === "active" || s.status === "idle").length,
   );
 
-  function setSort(k: SortKey) {
-    if (sortKey === k) {
-      sortDir = sortDir === "desc" ? "asc" : "desc";
-    } else {
+  function onSortSessions(k: SessionSortKey) {
+    if (k === sortKey) sortDir = sortDir === "asc" ? "desc" : "asc";
+    else {
       sortKey = k;
       sortDir = k === "name" || k === "repo" || k === "model" ? "asc" : "desc";
     }
   }
 
-  function sortIndicator(k: SortKey): string {
-    if (sortKey !== k) return "";
-    return sortDir === "desc" ? " ▾" : " ▴";
+  function repoVal(r: Repo, k: RepoSortKey): number | string {
+    const v = r[k];
+    if (typeof v === "string") return v.toLowerCase();
+    return (v as number) ?? 0;
   }
 
-  const totalCost = $derived(visible.reduce((acc, s) => acc + (s.cost_usd ?? 0), 0));
-  const hiddenCount = $derived(hidden.size);
+  const sortedRepos = $derived.by(() => {
+    const r = repos.slice();
+    r.sort((a, b) => {
+      const av = repoVal(a, repoSortKey);
+      const bv = repoVal(b, repoSortKey);
+      const cmp =
+        typeof av === "string" && typeof bv === "string"
+          ? av.localeCompare(bv)
+          : (av as number) - (bv as number);
+      return repoSortDir === "asc" ? cmp : -cmp;
+    });
+    return r;
+  });
+  const maxRepoCost = $derived(
+    Math.max(...repos.map((r) => r.total_cost_usd), 0.0001),
+  );
+  const grandCost = $derived(repos.reduce((s, r) => s + r.total_cost_usd, 0));
+
+  function onSortRepos(k: RepoSortKey) {
+    if (k === repoSortKey) repoSortDir = repoSortDir === "asc" ? "desc" : "asc";
+    else {
+      repoSortKey = k;
+      repoSortDir = k === "repo" || k === "top_model" ? "asc" : "desc";
+    }
+  }
+
+  const sessionCols: Array<{
+    k: SessionSortKey | "status" | "actions";
+    label: string;
+    align: "left" | "right";
+    sort: boolean;
+  }> = [
+    { k: "status", label: "", align: "left", sort: false },
+    { k: "name", label: "Session", align: "left", sort: true },
+    { k: "repo", label: "Repo", align: "left", sort: true },
+    { k: "model", label: "Model", align: "left", sort: true },
+    { k: "context", label: "Context", align: "left", sort: true },
+    { k: "tokens", label: "Tokens", align: "right", sort: true },
+    { k: "cost_usd", label: "Cost", align: "right", sort: true },
+    { k: "subagent_count", label: "Sub", align: "right", sort: true },
+    { k: "updated_at_ms", label: "Updated", align: "right", sort: true },
+    { k: "actions", label: "", align: "right", sort: false },
+  ];
+
+  const repoCols: Array<{
+    k: RepoSortKey;
+    label: string;
+    align: "left" | "right";
+  }> = [
+    { k: "repo", label: "Repository", align: "left" },
+    { k: "session_count", label: "Sessions", align: "right" },
+    { k: "live_count", label: "Live", align: "right" },
+    { k: "total_tokens", label: "Tokens", align: "right" },
+    { k: "total_cost_usd", label: "Total cost", align: "right" },
+    { k: "top_model", label: "Top model", align: "left" },
+  ];
 </script>
 
-<main>
-  <header>
-    <div>
-      <h1>Tokenscope Dashboard</h1>
-      <span class="stats">
-        {visible.length} of {sessions.length} sessions · ${totalCost.toFixed(2)} total
-        {#if hiddenCount > 0}
-          · {hiddenCount} hidden
-        {/if}
-      </span>
-    </div>
-    <button class="icon-btn" onclick={() => load(true)} disabled={loading} title="Refresh">↻</button>
-  </header>
+<div class="dash-win">
+  <div class="dash-body">
+    <aside class="dash-sidebar">
+      <div class="dash-sb-section">MONITOR</div>
+      <button
+        class="dash-navitem"
+        class:is-on={view === "sessions"}
+        onclick={() => (view = "sessions")}
+      >
+        <Icon name="list" size={15} />
+        <span>Sessions</span>
+        <span class="dash-nav-count ts-tnum">{sessions.length}</span>
+      </button>
+      <button
+        class="dash-navitem"
+        class:is-on={view === "repos"}
+        onclick={() => (view = "repos")}
+      >
+        <Icon name="layers" size={15} />
+        <span>Repositories</span>
+        <span class="dash-nav-count ts-tnum">{repos.length}</span>
+      </button>
 
-  <nav class="tabs">
-    <button class:active={tab === "sessions"} onclick={() => (tab = "sessions")}>
-      Sessions
-    </button>
-    <button class:active={tab === "repos"} onclick={() => (tab = "repos")}>
-      Repos ({repos.length})
-    </button>
-  </nav>
+      <div class="dash-sb-spacer"></div>
 
-  {#if loading}
-    <p class="empty">Loading…</p>
-  {:else if error}
-    <p class="error">{error}</p>
-  {:else if tab === "sessions"}
-    <div class="filters">
-      <input
-        class="search"
-        type="search"
-        placeholder="Search by name, UID, cwd, model…"
-        bind:value={search}
-      />
-      <select bind:value={statusFilter}>
-        <option value="all">All status</option>
-        <option value="live">Live (active+idle)</option>
-        <option value="inactive">Inactive</option>
-      </select>
-      <select bind:value={repoFilter}>
-        <option value="all">All repos</option>
-        {#each allRepos as r}
-          <option value={r}>{r}</option>
-        {/each}
-      </select>
-      <label class="chk">
-        <input type="checkbox" bind:checked={showHidden} />
-        Show hidden ({hiddenCount})
-      </label>
-      {#if showHidden && hiddenCount > 0}
-        <button class="link" onclick={unhideAll}>Unhide all</button>
-      {/if}
-    </div>
+      <div class="dash-sb-foot">
+        <div class="dash-sb-live ts-tnum">
+          <span class="dash-livepip"></span>
+          {liveCount} session{liveCount === 1 ? "" : "s"} live
+        </div>
+        <div class="dash-sb-path ts-mono">~/.claude/</div>
+      </div>
+    </aside>
 
-    {#if visible.length === 0}
-      <p class="empty">No sessions match.</p>
-    {:else}
-      <table class="grid">
-        <thead>
-          <tr>
-            <th class="sortable" onclick={() => setSort("name")}>
-              NAME{sortIndicator("name")}
-            </th>
-            <th class="sortable" onclick={() => setSort("repo")}>
-              REPO{sortIndicator("repo")}
-            </th>
-            <th class="sortable" onclick={() => setSort("status")}>
-              STATUS{sortIndicator("status")}
-            </th>
-            <th class="num sortable" onclick={() => setSort("tokens")}>
-              TOKENS{sortIndicator("tokens")}
-            </th>
-            <th class="num sortable" onclick={() => setSort("context")}>
-              CTX%{sortIndicator("context")}
-            </th>
-            <th class="num sortable" onclick={() => setSort("cost")}>
-              COST{sortIndicator("cost")}
-            </th>
-            <th class="sortable" onclick={() => setSort("model")}>
-              MODEL{sortIndicator("model")}
-            </th>
-            <th class="sortable" onclick={() => setSort("updated")}>
-              UPDATED{sortIndicator("updated")}
-            </th>
-            <th>SUBS</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each visible as s (s.session_id)}
-            {@const pct = ctxPct(s)}
-            {@const isHidden = hidden.has(s.session_id)}
-            <tr class={s.status} class:hidden-row={isHidden}>
-              <td>
-                <button
-                  type="button"
-                  class="row-toggle"
-                  onclick={() =>
-                    (expandedId = expandedId === s.session_id ? null : s.session_id)}
-                  title={s.session_id}
-                >
-                  <span class="dot {s.status}"></span>
-                  {s.name ?? short(s.session_id)}
+    <main class="dash-main">
+      <div class="ts-dashbody">
+        {#if loading}
+          <div class="ts-empty">Loading…</div>
+        {:else if error}
+          <div class="ts-empty ts-err">{error}</div>
+        {:else if view === "sessions"}
+          <div class="ts-dash-h1row">
+            <h1 class="ts-dash-h1">Sessions</h1>
+            <span class="ts-dash-sub ts-tnum">
+              {filteredSessions.length} shown · {liveCount} live
+            </span>
+          </div>
+
+          <div class="ts-toolbar">
+            <div class="ts-searchbox">
+              <span class="ts-search-ico"><Icon name="search" size={14} /></span>
+              <input
+                class="ts-search-input"
+                type="text"
+                placeholder="Search name, path, or UID…"
+                bind:value={search}
+              />
+              {#if search}
+                <button class="ts-search-clear" onclick={() => (search = "")}>
+                  <Icon name="x" size={13} />
                 </button>
-              </td>
-              <td>{repoName(s.cwd)}</td>
-              <td>{s.status}</td>
-              <td class="num">{compact(sessionTotal(s))}</td>
-              <td class="num">
-                {#if s.context_tokens > 0 && s.status !== "inactive"}
-                  <span style="color: {ctxColor(pct)};">{pct.toFixed(0)}%</span>
-                {:else}
-                  —
-                {/if}
-              </td>
-              <td class="num">{fmtCost(s.cost_usd)}</td>
-              <td class="mono">{shortModel(s.model)}</td>
-              <td class="mono">{fmtDateTime(s.updated_at_ms)}</td>
-              <td class="num">
-                {s.subagent_count > 0 ? s.subagent_count : "—"}
-              </td>
-              <td class="actions">
-                {#if isHidden}
-                  <button
-                    class="btn-ghost"
-                    onclick={() => unhideSession(s.session_id)}
-                  >
-                    Unhide
-                  </button>
-                {:else}
-                  <button class="btn-ghost" onclick={() => hideSession(s.session_id)}>
-                    Hide
-                  </button>
-                {/if}
-                {#if s.status === "inactive"}
-                  {#if confirmDeleteId === s.session_id}
-                    <button
-                      class="btn-danger"
-                      onclick={() => deleteSession(s.session_id)}
-                    >
-                      Confirm delete
-                    </button>
-                    <button class="btn-ghost" onclick={() => (confirmDeleteId = null)}>
-                      Cancel
-                    </button>
-                  {:else}
-                    <button
-                      class="btn-ghost"
-                      onclick={() => (confirmDeleteId = s.session_id)}
-                    >
-                      Delete
-                    </button>
+              {/if}
+            </div>
+
+            <div class="ts-segmented">
+              {#each ["all", "active", "idle", "inactive"] as const as st}
+                <button
+                  class="ts-seg"
+                  class:is-on={statusFilter === st}
+                  onclick={() => (statusFilter = st)}
+                >
+                  {#if st !== "all"}
+                    <StatusDot status={st} size={6} />
                   {/if}
-                {/if}
-              </td>
-            </tr>
-            {#if expandedId === s.session_id}
-              <tr class="detail-row">
-                <td colspan="10">
-                  <dl class="detail">
-                    <dt>UID</dt><dd class="mono">{s.session_id}</dd>
-                    <dt>PID</dt><dd class="mono">{s.pid ?? "—"}</dd>
-                    <dt>cwd</dt><dd class="mono">{s.cwd ?? "—"}</dd>
-                    <dt>model</dt><dd class="mono">{s.model ?? "—"}</dd>
-                    <dt>context</dt>
-                    <dd>
-                      {compact(s.context_tokens)} / {compact(s.context_limit)} ({pct.toFixed(1)}%)
-                    </dd>
-                    <dt>main tokens</dt>
-                    <dd>
-                      in {compact(s.tokens.input)} · out {compact(s.tokens.output)} ·
-                      cache w {compact(s.tokens.cache_creation)} · cache r {compact(
-                        s.tokens.cache_read,
-                      )}
-                    </dd>
-                    {#if s.subagent_count > 0}
-                      <dt>subagent tokens</dt>
-                      <dd>
-                        {s.subagent_count} agents · in {compact(s.subagent_tokens.input)}
-                        · out {compact(s.subagent_tokens.output)} · cache w {compact(
-                          s.subagent_tokens.cache_creation,
-                        )} · cache r {compact(s.subagent_tokens.cache_read)}
-                      </dd>
+                  {st}
+                </button>
+              {/each}
+            </div>
+
+            <select class="ts-select" bind:value={repoFilter}>
+              {#each repoOptions as r}
+                <option value={r}>{r === "all" ? "All repos" : r}</option>
+              {/each}
+            </select>
+
+            <button
+              class="ts-ghostbtn"
+              class:is-on={showHidden}
+              onclick={() => (showHidden = !showHidden)}
+            >
+              <Icon name={showHidden ? "eye" : "eyeOff"} size={14} />
+              {hidden.size > 0 ? `${hidden.size} hidden` : "hidden"}
+            </button>
+          </div>
+
+          <div class="ts-table ts-sesstable">
+            <div class="ts-tr ts-tr-head ts-sess-grid">
+              {#each sessionCols as c}
+                {#if !c.sort}
+                  <div class="ts-th ts-al-{c.align}">{c.label}</div>
+                {:else}
+                  <button
+                    class="ts-th ts-al-{c.align}"
+                    class:is-sorted={sortKey === c.k}
+                    onclick={() => onSortSessions(c.k as SessionSortKey)}
+                  >
+                    {c.label}
+                    {#if sortKey === c.k}
+                      <span class="ts-sortarrow">{sortDir === "asc" ? "▴" : "▾"}</span>
                     {/if}
-                  </dl>
-                </td>
-              </tr>
-            {/if}
-          {/each}
-        </tbody>
-      </table>
-    {/if}
-  {:else if tab === "repos"}
-    {#if repos.length === 0}
-      <p class="empty">No repos.</p>
-    {:else}
-      <table class="grid">
-        <thead>
-          <tr>
-            <th>REPO</th>
-            <th class="num">SESSIONS</th>
-            <th class="num">LIVE</th>
-            <th class="num">TOKENS</th>
-            <th class="num">TOTAL COST</th>
-            <th>TOP MODEL</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each repos as r (r.repo)}
-            <tr>
-              <td>{r.repo}</td>
-              <td class="num">{r.session_count}</td>
-              <td class="num">{r.live_count}</td>
-              <td class="num">{compact(r.total_tokens)}</td>
-              <td class="num">{fmtCost(r.total_cost_usd)}</td>
-              <td class="mono">{shortModel(r.top_model)}</td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    {/if}
+                  </button>
+                {/if}
+              {/each}
+            </div>
+            <div class="ts-tbody">
+              {#if filteredSessions.length === 0}
+                <div class="ts-empty">No sessions match these filters.</div>
+              {/if}
+              {#each filteredSessions as s (s.session_id)}
+                {@const pct = Math.round((s.context_tokens / s.context_limit) * 100)}
+                {@const tier = contextTier(pct)}
+                {@const open = openId === s.session_id}
+                {@const isHidden = hidden.has(s.session_id)}
+                {@const subTok = totalTokens(s.subagent_tokens)}
+                <div
+                  class="ts-rowwrap"
+                  class:is-open={open}
+                  class:is-hidden-row={isHidden}
+                >
+                  <div
+                    class="ts-tr ts-sess-grid ts-sess-row"
+                    role="button"
+                    tabindex="0"
+                    onclick={() =>
+                      (openId = open ? null : s.session_id)}
+                    onkeydown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        openId = open ? null : s.session_id;
+                      }
+                    }}
+                  >
+                    <div class="ts-td"><StatusDot status={s.status} /></div>
+                    <div class="ts-td ts-sess-name">
+                      <span class="ts-row-caret">
+                        <Icon
+                          name={open ? "chevronDown" : "chevronRight"}
+                          size={13}
+                        />
+                      </span>
+                      <span class={s.name ? "" : "ts-mono ts-text2"}>
+                        {s.name ?? s.session_id.slice(0, 8)}
+                      </span>
+                    </div>
+                    <div class="ts-td ts-mono ts-text2">{repoName(s.cwd)}</div>
+                    <div class="ts-td">
+                      <span class="ts-modeltag">{fmtModel(s.model)}</span>
+                    </div>
+                    <div class="ts-td ts-ctx-cell">
+                      <ContextBar {pct} height={4} />
+                      <span
+                        class="ts-tnum ts-ctx-pct"
+                        style="color:var(--ts-tier-{tier});">{pct}%</span
+                      >
+                    </div>
+                    <div class="ts-td ts-al-right ts-tnum ts-text2">
+                      {fmtTokensShort(totalTokens(s.tokens))}
+                    </div>
+                    <div class="ts-td ts-al-right ts-tnum ts-cost-strong">
+                      {fmtUSD(s.cost_usd)}
+                    </div>
+                    <div class="ts-td ts-al-right ts-tnum ts-text3">
+                      {s.subagent_count || "—"}
+                    </div>
+                    <div class="ts-td ts-al-right ts-tnum ts-text3">
+                      {fmtRelTime(s.updated_at_ms, now)}
+                    </div>
+                    <div
+                      class="ts-td ts-al-right ts-row-actions"
+                      onclick={(e) => e.stopPropagation()}
+                      role="presentation"
+                    >
+                      {#if showHidden}
+                        <button
+                          class="ts-iconbtn"
+                          title={isHidden ? "Unhide" : "Hide"}
+                          onclick={() => toggleHide(s)}
+                        >
+                          <Icon name={isHidden ? "eye" : "eyeOff"} size={14} />
+                        </button>
+                      {:else}
+                        <button
+                          class="ts-iconbtn"
+                          title="Hide"
+                          onclick={() => toggleHide(s)}
+                        >
+                          <Icon name="eyeOff" size={14} />
+                        </button>
+                      {/if}
+                      <button
+                        class="ts-iconbtn is-danger"
+                        title={s.status === "inactive"
+                          ? "Delete"
+                          : "Only inactive sessions can be deleted"}
+                        disabled={s.status !== "inactive"}
+                        onclick={() => (confirm = s)}
+                      >
+                        <Icon name="trash" size={14} />
+                      </button>
+                    </div>
+                  </div>
+                  {#if open}
+                    <div class="ts-rowdetail">
+                      <div class="ts-rd-grid">
+                        <div class="ts-tokcol">
+                          <div class="ts-tokcol-title">Session tokens</div>
+                          <div class="ts-tokrow"><span>input</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.tokens.input)}</span></div>
+                          <div class="ts-tokrow"><span>output</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.tokens.output)}</span></div>
+                          <div class="ts-tokrow"><span>cache write</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.tokens.cache_creation)}</span></div>
+                          <div class="ts-tokrow"><span>cache read</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.tokens.cache_read)}</span></div>
+                        </div>
+                        <div class="ts-tokcol" class:is-muted={subTok === 0}>
+                          <div class="ts-tokcol-title">
+                            Subagent tokens ({s.subagent_count})
+                          </div>
+                          <div class="ts-tokrow"><span>input</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.subagent_tokens.input)}</span></div>
+                          <div class="ts-tokrow"><span>output</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.subagent_tokens.output)}</span></div>
+                          <div class="ts-tokrow"><span>cache write</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.subagent_tokens.cache_creation)}</span></div>
+                          <div class="ts-tokrow"><span>cache read</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.subagent_tokens.cache_read)}</span></div>
+                        </div>
+                        <div class="ts-rd-meta">
+                          <div class="ts-drow"><span class="ts-drow-k">Context</span><span class="ts-drow-v ts-tnum" style="color:var(--ts-tier-{tier});">{fmtTokensFull(s.context_tokens)} / {fmtTokensShort(s.context_limit)} · {pct}%</span></div>
+                          <div class="ts-drow"><span class="ts-drow-k">Cost</span><span class="ts-drow-v ts-tnum">{fmtUSD(s.cost_usd)}</span></div>
+                          <div class="ts-drow"><span class="ts-drow-k">Updated</span><span class="ts-drow-v ts-tnum">{fmtRelTime(s.updated_at_ms, now)}</span></div>
+                          <div class="ts-drow"><span class="ts-drow-k">PID</span><span class="ts-drow-v ts-mono ts-tnum">{s.pid ?? "— not running"}</span></div>
+                          <div class="ts-drow"><span class="ts-drow-k">Path</span><span class="ts-drow-v ts-mono is-ellipsis" title={s.cwd ?? ""}>{s.cwd ?? "—"}</span></div>
+                          <div class="ts-drow"><span class="ts-drow-k">UID</span><span class="ts-drow-v ts-mono is-ellipsis" title={s.session_id}>{s.session_id}</span></div>
+                        </div>
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          </div>
+        {:else if view === "repos"}
+          <div class="ts-dash-h1row">
+            <h1 class="ts-dash-h1">Repositories</h1>
+            <span class="ts-dash-sub ts-tnum">
+              {repos.length} repos · {fmtUSD(grandCost)} total this week
+            </span>
+          </div>
+
+          <div class="ts-table ts-repotable">
+            <div class="ts-tr ts-tr-head">
+              {#each repoCols as c}
+                <button
+                  class="ts-th ts-al-{c.align}"
+                  class:is-sorted={repoSortKey === c.k}
+                  onclick={() => onSortRepos(c.k)}
+                >
+                  {c.label}
+                  {#if repoSortKey === c.k}
+                    <span class="ts-sortarrow">{repoSortDir === "asc" ? "▴" : "▾"}</span>
+                  {/if}
+                </button>
+              {/each}
+            </div>
+            <div class="ts-tbody">
+              {#if sortedRepos.length === 0}
+                <div class="ts-empty">No repositories yet.</div>
+              {/if}
+              {#each sortedRepos as r}
+                <div class="ts-tr ts-repo-row">
+                  <div class="ts-td ts-repo-name">
+                    <span class="ts-repo-ico"><Icon name="folder" size={14} /></span>
+                    <span class="ts-mono">{r.repo}</span>
+                  </div>
+                  <div class="ts-td ts-al-right ts-tnum">{r.session_count}</div>
+                  <div class="ts-td ts-al-right ts-tnum">
+                    {#if r.live_count > 0}
+                      <span class="ts-live-pill"
+                        ><span class="ts-live-pip"></span>{r.live_count}</span
+                      >
+                    {:else}
+                      <span class="ts-text3">0</span>
+                    {/if}
+                  </div>
+                  <div class="ts-td ts-al-right ts-tnum ts-text2">
+                    {fmtTokensShort(r.total_tokens)}
+                  </div>
+                  <div class="ts-td ts-al-right ts-cost-cell">
+                    <div class="ts-cost-bar">
+                      <div
+                        class="ts-cost-fill"
+                        style="width:{(r.total_cost_usd / maxRepoCost) * 100}%;"
+                      ></div>
+                    </div>
+                    <span class="ts-tnum ts-cost-val">
+                      {fmtUSD(r.total_cost_usd)}
+                    </span>
+                  </div>
+                  <div class="ts-td">
+                    {#if r.top_model}
+                      <span class="ts-modeltag">{fmtModel(r.top_model)}</span>
+                    {:else}
+                      <span class="ts-text3">—</span>
+                    {/if}
+                  </div>
+                </div>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      </div>
+    </main>
+  </div>
+
+  {#if confirm}
+    {@const s = confirm}
+    {@const name = s.name || s.session_id.slice(0, 8)}
+    <div
+      class="ts-modal-scrim"
+      onclick={() => (confirm = null)}
+      role="presentation"
+    >
+      <div
+        class="ts-modal"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.key === "Escape" && (confirm = null)}
+        role="dialog"
+        aria-modal="true"
+        tabindex="-1"
+      >
+        <div class="ts-modal-icon"><Icon name="trash" size={18} /></div>
+        <div class="ts-modal-title">Delete this session?</div>
+        <div class="ts-modal-body">
+          <span class="ts-modal-name">{name}</span> and its logs will be
+          permanently removed from
+          <span class="ts-mono"> ~/.claude/</span>. This can't be undone.
+        </div>
+        <div class="ts-modal-actions">
+          <button class="ts-btn ts-btn-ghost" onclick={() => (confirm = null)}
+            >Cancel</button
+          >
+          <button class="ts-btn ts-btn-danger" onclick={() => deleteSession(s)}
+            >Delete session</button
+          >
+        </div>
+      </div>
+    </div>
   {/if}
-</main>
+</div>
 
 <style>
-  :global(html, body) {
-    margin: 0;
-    padding: 0;
-    background: #141414;
-    color: #e0e0e0;
-    font-family:
-      -apple-system,
-      BlinkMacSystemFont,
-      "SF Pro Text",
-      sans-serif;
-    font-size: 13px;
-    line-height: 1.4;
-  }
-
-  main {
-    padding: 18px 22px;
-  }
-
-  header {
+  .dash-win {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    background: var(--ts-bg-dashboard);
+    color: var(--ts-text-1);
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    margin-bottom: 14px;
-    padding-bottom: 12px;
-    border-bottom: 1px solid #2a2a2a;
+    flex-direction: column;
+    overflow: hidden;
   }
-  h1 {
-    margin: 0;
-    font-size: 20px;
+  .dash-body {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+
+  /* sidebar */
+  .dash-sidebar {
+    width: 210px;
+    flex-shrink: 0;
+    background: var(--ts-bg-sidebar);
+    border-right: 1px solid var(--ts-border);
+    padding: 12px 10px;
+    display: flex;
+    flex-direction: column;
+  }
+  .dash-sb-section {
+    font-size: 10px;
     font-weight: 600;
+    letter-spacing: 0.6px;
+    color: var(--ts-text-3);
+    padding: 6px 8px 8px;
   }
-  .stats {
-    font-size: 12px;
-    color: #888;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .icon-btn,
-  .tabs button,
-  .filters select,
-  .filters input.search,
-  .btn-ghost,
-  .btn-danger,
-  .link {
-    background: #2a2a2a;
-    border: 1px solid #3a3a3a;
-    color: #e0e0e0;
-    padding: 6px 12px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 13px;
-    transition: background 0.12s, border 0.12s;
-  }
-  .icon-btn:hover,
-  .btn-ghost:hover {
-    background: #3a3a3a;
-  }
-  .icon-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .tabs {
+  .dash-navitem {
     display: flex;
-    gap: 6px;
-    margin-bottom: 14px;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 7px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-family: var(--ts-font);
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--ts-text-2);
+    transition: 0.12s;
+    text-align: left;
   }
-  .tabs button.active {
-    background: #3a3a3a;
-    border-color: #4a4a4a;
+  .dash-navitem:hover {
+    background: var(--ts-surface);
+    color: var(--ts-text-1);
+  }
+  .dash-navitem.is-on {
+    background: var(--ts-accent);
+    color: #fff;
+    font-weight: 550;
+  }
+  .dash-nav-count {
+    margin-left: auto;
+    font-size: 11.5px;
+    color: var(--ts-text-3);
+    background: var(--ts-surface);
+    padding: 1px 7px;
+    border-radius: 10px;
+  }
+  .dash-navitem.is-on .dash-nav-count {
+    background: rgba(255, 255, 255, 0.22);
     color: #fff;
   }
-
-  .filters {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    align-items: center;
-    margin-bottom: 12px;
-  }
-  .filters .search {
+  .dash-sb-spacer {
     flex: 1;
-    min-width: 220px;
-    cursor: text;
   }
-  .chk {
+  .dash-sb-foot {
+    padding: 8px;
+    border-top: 1px solid var(--ts-border);
+  }
+  .dash-sb-live {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 11.5px;
+    color: var(--ts-text-2);
+  }
+  .dash-livepip {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--ts-st-active);
+  }
+  .dash-sb-path {
+    font-size: 11px;
+    color: var(--ts-text-3);
+    margin-top: 6px;
+  }
+
+  /* main */
+  .dash-main {
+    flex: 1;
+    min-width: 0;
+    background: var(--ts-bg-content);
+    overflow: hidden;
+    display: flex;
+  }
+  .ts-dashbody {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 22px 26px;
+    overflow: hidden;
+    position: relative;
+  }
+  .ts-dash-h1row {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 18px;
+    flex-shrink: 0;
+  }
+  .ts-dash-h1 {
+    font-size: 21px;
+    font-weight: 650;
+    letter-spacing: -0.3px;
+    margin: 0;
+  }
+  .ts-dash-sub {
+    font-size: 12.5px;
+    color: var(--ts-text-3);
+  }
+
+  /* toolbar */
+  .ts-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+    flex-shrink: 0;
+  }
+  .ts-searchbox {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    background: var(--ts-surface-2);
+    border: 1px solid var(--ts-border-2);
+    border-radius: 8px;
+    padding: 0 10px;
+    height: 32px;
+    width: 250px;
+  }
+  .ts-searchbox:focus-within {
+    border-color: var(--ts-accent);
+    box-shadow: 0 0 0 3px var(--ts-accent-weak);
+  }
+  .ts-search-ico {
+    color: var(--ts-text-3);
+    display: inline-flex;
+  }
+  .ts-search-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    font-family: var(--ts-font);
+    font-size: 13px;
+    color: var(--ts-text-1);
+  }
+  .ts-search-input::placeholder {
+    color: var(--ts-text-3);
+  }
+  .ts-search-clear {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: var(--ts-text-3);
+    display: flex;
+    padding: 2px;
+    border-radius: 4px;
+  }
+  .ts-search-clear:hover {
+    color: var(--ts-text-1);
+    background: var(--ts-surface-hi);
+  }
+  .ts-segmented {
+    display: flex;
+    background: var(--ts-surface-2);
+    border: 1px solid var(--ts-border-2);
+    border-radius: 8px;
+    padding: 2px;
+    gap: 1px;
+  }
+  .ts-seg {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-family: var(--ts-font);
+    font-size: 12px;
+    color: var(--ts-text-2);
+    padding: 5px 10px;
+    border-radius: 6px;
+    text-transform: capitalize;
+    transition: 0.1s;
+  }
+  .ts-seg:hover {
+    color: var(--ts-text-1);
+  }
+  .ts-seg.is-on {
+    background: var(--ts-surface-hi);
+    color: var(--ts-text-1);
+    font-weight: 550;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  }
+  .ts-select {
+    font-family: var(--ts-font);
+    font-size: 12.5px;
+    color: var(--ts-text-1);
+    background: var(--ts-surface-2);
+    border: 1px solid var(--ts-border-2);
+    border-radius: 8px;
+    padding: 0 28px 0 10px;
+    height: 32px;
+    cursor: pointer;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 9px center;
+  }
+  .ts-ghostbtn {
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
-    color: #aaa;
+    margin-left: auto;
+    background: var(--ts-surface-2);
+    border: 1px solid var(--ts-border-2);
+    border-radius: 8px;
+    height: 32px;
+    padding: 0 12px;
+    cursor: pointer;
+    font-family: var(--ts-font);
+    font-size: 12.5px;
+    color: var(--ts-text-2);
+    transition: 0.12s;
+  }
+  .ts-ghostbtn:hover {
+    color: var(--ts-text-1);
+    border-color: var(--ts-text-3);
+  }
+  .ts-ghostbtn.is-on {
+    color: var(--ts-accent);
+    border-color: var(--ts-accent-line);
+    background: var(--ts-accent-weak);
+  }
+
+  /* table */
+  .ts-table {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border: 1px solid var(--ts-border);
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--ts-bg-content);
+  }
+  .ts-tr-head {
+    background: var(--ts-surface-2);
+    border-bottom: 1px solid var(--ts-border);
+    flex-shrink: 0;
+  }
+  .ts-th {
+    font-family: var(--ts-font);
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    color: var(--ts-text-3);
+    text-transform: uppercase;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 9px 10px;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .ts-th:hover {
+    color: var(--ts-text-1);
+  }
+  .ts-th.is-sorted {
+    color: var(--ts-text-1);
+  }
+  .ts-al-right {
+    justify-content: flex-end;
+    text-align: right;
+  }
+  .ts-sortarrow {
+    font-size: 9px;
+  }
+  .ts-tbody {
+    flex: 1;
+    overflow-y: auto;
+  }
+  .ts-tbody::-webkit-scrollbar {
+    width: 10px;
+  }
+  .ts-tbody::-webkit-scrollbar-thumb {
+    background: var(--ts-border-2);
+    border-radius: 6px;
+    border: 2px solid var(--ts-bg-content);
+  }
+
+  /* repos table grid */
+  .ts-repotable .ts-tr {
+    display: grid;
+    grid-template-columns: 1.6fr 0.9fr 0.7fr 1fr 1.4fr 1.2fr;
+    align-items: center;
+  }
+  .ts-repo-row {
+    padding: 0;
+    border-bottom: 1px solid var(--ts-border);
+  }
+  .ts-repo-row:hover {
+    background: var(--ts-surface-2);
+  }
+  .ts-td {
+    padding: 11px 10px;
+    font-size: 13px;
+  }
+  .ts-repo-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .ts-repo-ico {
+    color: var(--ts-text-3);
+    display: inline-flex;
+  }
+  .ts-live-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--ts-st-active);
+    font-weight: 600;
+  }
+  .ts-live-pip {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--ts-st-active);
+  }
+  .ts-cost-cell {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    justify-content: flex-end;
+  }
+  .ts-cost-bar {
+    width: 70px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--ts-surface-hi);
+    overflow: hidden;
+  }
+  .ts-cost-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--ts-accent);
+  }
+  .ts-cost-val {
+    font-weight: 600;
+    min-width: 52px;
+    text-align: right;
+  }
+
+  /* sessions table grid */
+  .ts-sess-grid {
+    display: grid;
+    grid-template-columns: 26px 1.7fr 1fr 1fr 1.3fr 0.9fr 0.8fr 0.5fr 1fr 76px;
+    align-items: center;
+  }
+  .ts-sess-row {
     cursor: pointer;
   }
-  .link {
-    background: none;
-    border: none;
-    color: #888;
-    font-size: 11px;
-    padding: 4px 8px;
+  .ts-rowwrap {
+    border-bottom: 1px solid var(--ts-border);
   }
-  .link:hover {
-    color: #ddd;
+  .ts-rowwrap:hover {
+    background: var(--ts-surface-2);
   }
-
-  .empty,
-  .error {
-    text-align: center;
-    color: #888;
-    padding: 32px;
+  .ts-rowwrap.is-open {
+    background: var(--ts-surface-2);
   }
-  .error {
-    color: #ff6b6b;
+  .ts-rowwrap.is-hidden-row {
+    opacity: 0.5;
   }
-
-  table.grid {
-    width: 100%;
-    border-collapse: collapse;
-    font-variant-numeric: tabular-nums;
-  }
-  th,
-  td {
-    padding: 7px 10px;
-    text-align: left;
-    border-bottom: 1px solid #1f1f1f;
+  .ts-sess-name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 500;
     white-space: nowrap;
-    max-width: 360px;
+    overflow: hidden;
+  }
+  .ts-sess-name > span:last-child {
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  th {
-    font-weight: 600;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: #888;
-    background: #141414;
-    position: sticky;
-    top: 0;
-  }
-  th.sortable {
-    cursor: pointer;
-    user-select: none;
-  }
-  th.sortable:hover {
-    color: #ddd;
-  }
-  th.num,
-  td.num {
-    text-align: right;
-  }
-  .mono {
-    font-family: "SF Mono", Menlo, monospace;
-    font-size: 11px;
-  }
-  tr.active td {
-    color: #d8f5d8;
-  }
-  tr.idle td {
-    color: #f5ecd0;
-  }
-  tr.inactive td {
-    color: #aaa;
-  }
-  tr.hidden-row td {
-    opacity: 0.45;
-  }
-
-  .row-toggle {
-    background: none;
-    border: none;
-    color: inherit;
-    cursor: pointer;
-    padding: 0;
-    font: inherit;
-    text-align: left;
+  .ts-row-caret {
+    color: var(--ts-text-3);
+    flex-shrink: 0;
     display: inline-flex;
+  }
+  .ts-ctx-cell {
+    display: flex;
     align-items: center;
     gap: 8px;
   }
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #555;
+  .ts-ctx-pct {
+    font-size: 11px;
+    font-weight: 600;
+    width: 30px;
+    text-align: right;
     flex-shrink: 0;
   }
-  .dot.active {
-    background: #4ade80;
+  .ts-cost-strong {
+    font-weight: 600;
   }
-  .dot.idle {
-    background: #facc15;
-  }
-  .dot.inactive {
-    background: #555;
-  }
-
-  .actions {
+  .ts-row-actions {
     display: flex;
-    gap: 4px;
+    gap: 2px;
     justify-content: flex-end;
+    opacity: 0;
+    transition: opacity 0.12s;
   }
-  .btn-ghost {
-    padding: 4px 10px;
-    font-size: 11px;
+  .ts-rowwrap:hover .ts-row-actions,
+  .ts-rowwrap.is-open .ts-row-actions {
+    opacity: 1;
   }
-  .btn-danger {
-    padding: 4px 10px;
-    font-size: 11px;
-    background: #7c1d1d;
-    border-color: #a02b2b;
-    color: #ffe4e4;
+  .ts-iconbtn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: var(--ts-text-2);
+    transition: 0.12s;
   }
-  .btn-danger:hover {
-    background: #a02b2b;
+  .ts-iconbtn:hover {
+    background: var(--ts-surface-hi);
+    color: var(--ts-text-1);
+  }
+  .ts-iconbtn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  .ts-iconbtn.is-danger:not(:disabled):hover {
+    background: rgba(239, 68, 68, 0.14);
+    color: var(--ts-tier-critical);
+  }
+  .ts-rowdetail {
+    padding: 4px 16px 16px 38px;
+    background: var(--ts-surface-2);
+    border-top: 1px solid var(--ts-border);
+    animation: ts-fadein 0.14s ease;
+  }
+  @keyframes ts-fadein {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  .ts-rd-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1.3fr;
+    gap: 10px 16px;
+  }
+  .ts-tokcol-title {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    color: var(--ts-text-3);
+    margin-bottom: 5px;
+  }
+  .ts-tokcol.is-muted {
+    opacity: 0.4;
+  }
+  .ts-tokrow {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11.5px;
+    color: var(--ts-text-2);
+    padding: 1.5px 0;
+  }
+  .ts-tokrow .ts-mono {
+    color: var(--ts-text-1);
+  }
+  .ts-rd-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .ts-drow {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 11.5px;
+    padding: 2px 0;
+  }
+  .ts-drow-k {
+    color: var(--ts-text-3);
+    flex-shrink: 0;
+  }
+  .ts-drow-v {
+    color: var(--ts-text-1);
+    text-align: right;
+  }
+  .ts-drow-v.is-ellipsis {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 230px;
+    direction: rtl;
+  }
+  .ts-empty {
+    padding: 40px;
+    text-align: center;
+    color: var(--ts-text-3);
+    font-size: 13px;
+  }
+  .ts-err {
+    color: var(--ts-tier-critical);
+  }
+  .ts-text2 {
+    color: var(--ts-text-2);
+  }
+  .ts-text3 {
+    color: var(--ts-text-3);
   }
 
-  tr.detail-row td {
-    background: #1a1a1a;
-    padding: 14px 22px;
+  .ts-modeltag {
+    font-family: var(--ts-mono);
+    font-size: 10.5px;
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: var(--ts-surface-hi);
+    color: var(--ts-text-2);
+    white-space: nowrap;
   }
-  .detail {
-    margin: 0;
-    display: grid;
-    grid-template-columns: 100px 1fr;
-    gap: 4px 14px;
-    font-size: 12px;
+
+  /* modal */
+  .ts-modal-scrim {
+    position: absolute;
+    inset: 0;
+    background: var(--ts-scrim);
+    backdrop-filter: blur(2px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    animation: ts-fadein 0.12s;
   }
-  .detail dt {
-    color: #888;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    font-size: 10px;
-    align-self: center;
+  .ts-modal {
+    width: 360px;
+    background: var(--ts-bg-popover);
+    border-radius: 12px;
+    padding: 22px;
+    box-shadow: var(--ts-win-shadow);
+    text-align: center;
+    animation: ts-modal-pop 0.16s cubic-bezier(0.2, 0.9, 0.3, 1);
   }
-  .detail dd {
-    margin: 0;
-    color: #ddd;
-    white-space: normal;
-    word-break: break-all;
+  @keyframes ts-modal-pop {
+    from {
+      opacity: 0;
+      transform: translateY(-6px) scale(0.985);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  .ts-modal-icon {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    background: rgba(239, 68, 68, 0.14);
+    color: var(--ts-tier-critical);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 14px;
+  }
+  .ts-modal-title {
+    font-size: 16px;
+    font-weight: 650;
+    margin-bottom: 8px;
+  }
+  .ts-modal-body {
+    font-size: 13px;
+    color: var(--ts-text-2);
+    line-height: 1.55;
+    margin-bottom: 20px;
+  }
+  .ts-modal-name {
+    font-weight: 600;
+    color: var(--ts-text-1);
+  }
+  .ts-modal-actions {
+    display: flex;
+    gap: 10px;
+  }
+  .ts-btn {
+    flex: 1;
+    height: 38px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    font-family: var(--ts-font);
+    font-size: 13px;
+    font-weight: 600;
+    transition: 0.12s;
+  }
+  .ts-btn-ghost {
+    background: var(--ts-surface);
+    color: var(--ts-text-1);
+    border: 1px solid var(--ts-border-2);
+  }
+  .ts-btn-ghost:hover {
+    background: var(--ts-surface-hi);
+  }
+  .ts-btn-danger {
+    background: var(--ts-tier-critical);
+    color: #fff;
+  }
+  .ts-btn-danger:hover {
+    filter: brightness(1.08);
   }
 </style>

@@ -1,0 +1,148 @@
+/* ============================================================
+   Tokenscope — Design Tokens
+   Drop-in for SvelteKit. Import once in your root layout:
+     import '$lib/styles/tokens.css';
+   Dark is the default. Light activates via [data-theme="light"]
+   on <html>, or automatically when the user has no override and
+   the system is light (prefers-color-scheme).
+   All numeric UI must use font-variant-numeric: tabular-nums.
+   ============================================================ */
+
+:root {
+  /* ---- Typography ---- */
+  --ts-font:  -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
+  --ts-mono:  ui-monospace, "SF Mono", "Menlo", "Cascadia Code", monospace;
+
+  /* type scale (px) */
+  --ts-fs-label:   10px;   /* ALL-CAPS section labels, 600, +0.5 tracking */
+  --ts-fs-meta:    11px;   /* repo · model · time, secondary chips        */
+  --ts-fs-2:       12px;   /* secondary body                               */
+  --ts-fs-body:    13px;   /* default body                                 */
+  --ts-fs-name:  13.5px;   /* session name                                 */
+  --ts-fs-cost:    14px;   /* inline cost                                  */
+  --ts-fs-stat:    18px;   /* block stat values                            */
+  --ts-fs-h1:      21px;   /* dashboard page title                         */
+  --ts-fs-hero:    34px;   /* popover hero cost                            */
+  --ts-fs-display: 40px;   /* active-block cost                            */
+
+  --ts-fw-regular: 450;
+  --ts-fw-medium:  550;
+  --ts-fw-semi:    600;
+  --ts-fw-bold:    650;
+
+  /* ---- Spacing scale (px) ---- */
+  --ts-sp-1: 4px;
+  --ts-sp-2: 8px;
+  --ts-sp-3: 12px;
+  --ts-sp-4: 16px;
+  --ts-sp-5: 20px;
+  --ts-sp-6: 24px;
+  --ts-sp-8: 32px;
+
+  /* ---- Radii (px) ---- */
+  --ts-r-sm:   6px;   /* chips, small buttons          */
+  --ts-r-md:   8px;   /* inputs, segmented, ghost btns */
+  --ts-r-card: 9px;   /* session cards                 */
+  --ts-r-lg:  11px;   /* panels, tables, windows       */
+  --ts-r-xl:  12px;   /* popover, modal                */
+  --ts-r-pill: 999px;
+
+  /* ---- Accent (mirror macOS system accent; blue is default) ---- */
+  --ts-accent:      #0a84ff;
+  --ts-accent-rgb:  10, 132, 255;
+  --ts-accent-weak: rgba(var(--ts-accent-rgb), 0.16);
+  --ts-accent-line: rgba(var(--ts-accent-rgb), 0.50);
+
+  /* ---- Status (live state). Pair color WITH a shape hint:
+          active = solid dot + pulse ring, idle = solid dot,
+          inactive = hollow ring. Never color alone. ---- */
+  --ts-st-active:   #4ade80;
+  --ts-st-idle:     #facc15;
+  --ts-st-inactive: #6a6a6a;
+
+  /* ---- Context / cost warning gradient (4 tiers) ---- */
+  --ts-tier-healthy:  #4ade80;  /* <50%    */
+  --ts-tier-warning:  #facc15;  /* 50–75%  */
+  --ts-tier-high:     #f97316;  /* 75–90%  */
+  --ts-tier-critical: #ef4444;  /* >=90%   */
+  --ts-burn-hot:      #f59e0b;  /* burn >= $0.50/hr emphasis */
+}
+
+/* ============================ DARK (default) ============================ */
+:root,
+[data-theme="dark"] {
+  --ts-bg-popover:   #1a1a1a;
+  --ts-bg-dashboard: #141414;
+  --ts-bg-content:   #161616;
+  --ts-bg-sidebar:   #181818;
+  --ts-surface:      #232323;  /* hover / expanded                 */
+  --ts-surface-2:    #1e1e1e;  /* resting card / input             */
+  --ts-surface-hi:   #272727;  /* track fills, tags                */
+  --ts-border:       #2a2a2a;  /* dividers                         */
+  --ts-border-2:     #343434;  /* input / interactive borders      */
+  --ts-text-1:       #e0e0e0;  /* primary                          */
+  --ts-text-2:       #8a8a8a;  /* secondary                        */
+  --ts-text-3:       #585858;  /* muted / labels                   */
+
+  --ts-menubar-bg:   rgba(28, 28, 30, 0.62);
+  --ts-menubar-text: rgba(255, 255, 255, 0.92);
+  --ts-win-shadow:   0 30px 80px -12px rgba(0,0,0,0.70), 0 0 0 0.5px rgba(255,255,255,0.06);
+  --ts-pop-shadow:   0 20px 60px -10px rgba(0,0,0,0.75), 0 0 0 0.5px rgba(255,255,255,0.07);
+  --ts-scrim:        rgba(0,0,0,0.55);
+}
+
+/* ============================ LIGHT ============================ */
+[data-theme="light"] {
+  --ts-bg-popover:   #ffffff;
+  --ts-bg-dashboard: #ececec;
+  --ts-bg-content:   #ffffff;
+  --ts-bg-sidebar:   #f3f3f3;
+  --ts-surface:      #f5f5f6;
+  --ts-surface-2:    #fafafa;
+  --ts-surface-hi:   #eeeef0;
+  --ts-border:       #e6e6e8;
+  --ts-border-2:     #d8d8dc;
+  --ts-text-1:       #1c1c1e;
+  --ts-text-2:       #6e6e73;
+  --ts-text-3:       #a8a8ad;
+
+  /* status nudged darker for AA contrast on white */
+  --ts-st-active:    #1aa251;
+  --ts-st-idle:      #c98a00;
+  --ts-st-inactive:  #b0b0b6;
+  --ts-tier-healthy: #16a34a;
+  --ts-tier-warning: #c98a00;
+  --ts-tier-high:    #ea580c;
+  --ts-tier-critical:#dc2626;
+  --ts-burn-hot:     #d97706;
+
+  --ts-accent-weak:  rgba(var(--ts-accent-rgb), 0.12);
+  --ts-accent-line:  rgba(var(--ts-accent-rgb), 0.40);
+  --ts-menubar-bg:   rgba(250, 250, 252, 0.66);
+  --ts-menubar-text: rgba(0, 0, 0, 0.84);
+  --ts-win-shadow:   0 30px 80px -16px rgba(0,0,0,0.32), 0 0 0 0.5px rgba(0,0,0,0.10);
+  --ts-pop-shadow:   0 22px 60px -12px rgba(0,0,0,0.28), 0 0 0 0.5px rgba(0,0,0,0.12);
+  --ts-scrim:        rgba(0,0,0,0.30);
+}
+
+/* Auto-follow system ONLY when user hasn't set an explicit override.
+   Put data-theme on <html> when the user picks; otherwise this wins. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --ts-bg-popover:#ffffff; --ts-bg-dashboard:#ececec; --ts-bg-content:#ffffff;
+    --ts-bg-sidebar:#f3f3f3; --ts-surface:#f5f5f6; --ts-surface-2:#fafafa;
+    --ts-surface-hi:#eeeef0; --ts-border:#e6e6e8; --ts-border-2:#d8d8dc;
+    --ts-text-1:#1c1c1e; --ts-text-2:#6e6e73; --ts-text-3:#a8a8ad;
+    --ts-st-active:#1aa251; --ts-st-idle:#c98a00; --ts-st-inactive:#b0b0b6;
+    --ts-tier-healthy:#16a34a; --ts-tier-warning:#c98a00; --ts-tier-high:#ea580c; --ts-tier-critical:#dc2626;
+    --ts-burn-hot:#d97706; --ts-accent-weak:rgba(var(--ts-accent-rgb),0.12); --ts-accent-line:rgba(var(--ts-accent-rgb),0.40);
+    --ts-menubar-bg:rgba(250,250,252,0.66); --ts-menubar-text:rgba(0,0,0,0.84);
+    --ts-win-shadow:0 30px 80px -16px rgba(0,0,0,0.32),0 0 0 0.5px rgba(0,0,0,0.10);
+    --ts-pop-shadow:0 22px 60px -12px rgba(0,0,0,0.28),0 0 0 0.5px rgba(0,0,0,0.12);
+    --ts-scrim:rgba(0,0,0,0.30);
+  }
+}
+
+/* ---- Base helpers you can reuse ---- */
+.ts-tnum { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1; }
+.ts-mono { font-family: var(--ts-mono); }

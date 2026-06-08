@@ -2,13 +2,24 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
-
-  type Tokens = {
-    input: number;
-    output: number;
-    cache_creation: number;
-    cache_read: number;
-  };
+  import {
+    fmtUSD,
+    fmtTokensShort,
+    fmtTokensFull,
+    totalTokens,
+    fmtRelTime,
+    fmtClock,
+    fmtDuration,
+    fmtModel,
+    contextTier,
+    repoName,
+    synthBurnSeries,
+    type Tokens,
+  } from "$lib/format";
+  import Icon from "$lib/components/Icon.svelte";
+  import StatusDot from "$lib/components/StatusDot.svelte";
+  import ContextBar from "$lib/components/ContextBar.svelte";
+  import Sparkline from "$lib/components/Sparkline.svelte";
 
   type Session = {
     session_id: string;
@@ -41,65 +52,22 @@
   };
 
   type Settings = { budget_window_usd: number };
-
   type Tab = "sessions" | "blocks" | "settings";
 
   let tab: Tab = $state("sessions");
   let sessions: Session[] = $state([]);
   let blocks: BlockView[] = $state([]);
-  let settings: Settings = $state({ budget_window_usd: 5 });
+  let settings: Settings = $state({ budget_window_usd: 0 });
   let loading = $state(true);
   let error: string | null = $state(null);
-  let savedFlash = $state(false);
   let now = $state(Date.now());
-  let showAllSessions = $state(false);
-  let showAllBlocks = $state(false);
   let expandedId: string | null = $state(null);
   let hidden: Set<string> = $state(new Set());
-  const DONE_BLOCKS_DEFAULT = 5;
+  let lastLoadedAt: number = $state(Date.now());
 
-  async function refreshHidden() {
+  async function load(showSpinner = false) {
     try {
-      const ids = await invoke<string[]>("list_hidden");
-      hidden = new Set(ids);
-    } catch (e) {
-      // non-fatal: hidden filter just doesn't apply
-      console.error(e);
-    }
-  }
-
-  async function hideSession(id: string) {
-    await invoke("hide_session", { sessionId: id });
-    expandedId = null;
-    // data-changed event will reload; refresh hidden set proactively
-    await refreshHidden();
-  }
-
-  async function openDashboard() {
-    await invoke("open_dashboard");
-  }
-
-  function toggleExpand(id: string) {
-    expandedId = expandedId === id ? null : id;
-  }
-
-  function relativeTime(ms: number | null): string {
-    if (ms === null) return "—";
-    const diff = Date.now() - ms;
-    if (diff < 0) return "just now";
-    const s = Math.floor(diff / 1000);
-    if (s < 60) return `${s}s ago`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m} min ago`;
-    const h = Math.floor(m / 60);
-    if (h < 24) return `${h}h ago`;
-    const d = Math.floor(h / 24);
-    return `${d}d ago`;
-  }
-
-  async function load() {
-    try {
-      loading = true;
+      if (showSpinner) loading = true;
       error = null;
       const [s, b, st, h] = await Promise.all([
         invoke<Session[]>("list_sessions"),
@@ -111,6 +79,7 @@
       blocks = b;
       settings = st;
       hidden = new Set(h);
+      lastLoadedAt = Date.now();
     } catch (e) {
       error = String(e);
     } finally {
@@ -121,19 +90,24 @@
   async function saveSettings() {
     try {
       await invoke("set_settings", { settings });
-      savedFlash = true;
-      setTimeout(() => (savedFlash = false), 1200);
     } catch (e) {
       error = String(e);
     }
   }
 
+  async function openDashboard() {
+    await invoke("open_dashboard");
+  }
+
+  function toggleExpand(id: string) {
+    expandedId = expandedId === id ? null : id;
+  }
+
   let unlisten: UnlistenFn | undefined;
   let tickHandle: ReturnType<typeof setInterval> | undefined;
   onMount(async () => {
-    await load();
-    unlisten = await listen("data-changed", () => load());
-    // Tick the "reset in" countdown for the active block every 30s.
+    await load(true);
+    unlisten = await listen("data-changed", () => load(false));
     tickHandle = setInterval(() => (now = Date.now()), 30_000);
   });
   onDestroy(() => {
@@ -141,95 +115,28 @@
     if (tickHandle) clearInterval(tickHandle);
   });
 
-  function short(id: string): string {
-    return id.slice(0, 8);
-  }
-
-  function compact(n: number): string {
-    if (n < 1_000) return String(n);
-    if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}K`;
-    if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-    return `${(n / 1_000_000_000).toFixed(1)}B`;
-  }
-
-  function fmtCost(c: number | null): string {
-    if (c === null) return "N/A";
-    if (c === 0) return "—";
-    if (c < 0.01) return "<$0.01";
-    return `$${c.toFixed(2)}`;
-  }
-
-  function repoName(cwd: string | null): string {
-    if (!cwd) return "-";
-    const parts = cwd.split("/").filter(Boolean);
-    return parts[parts.length - 1] ?? "-";
-  }
-
-  function totalTokens(t: Tokens): number {
-    return t.input + t.output + t.cache_creation;
-  }
-
-  function sessionTotal(s: Session): number {
-    return totalTokens(s.tokens) + totalTokens(s.subagent_tokens);
-  }
-
-  function fmtTime(ms: number): string {
-    const d = new Date(ms);
-    return d.toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-  }
-
-  function fmtDate(ms: number): string {
-    const d = new Date(ms);
-    return `${d.getMonth() + 1}/${d.getDate()}`;
-  }
-
-  function fmtDuration(ms: number): string {
-    if (ms <= 0) return "0m";
-    const mins = Math.floor(ms / 60_000);
-    if (mins < 60) return `${mins}m`;
-    const h = Math.floor(mins / 60);
-    const m = mins % 60;
-    return m === 0 ? `${h}h` : `${h}h${m}m`;
-  }
-
-  function shortModel(m: string | null): string {
-    if (!m) return "-";
-    // claude-opus-4-7 -> opus-4-7
-    return m.replace(/^claude-/, "");
-  }
-
-  function ctxPct(s: Session): number {
-    if (!s.context_limit) return 0;
-    return Math.min(100, (s.context_tokens / s.context_limit) * 100);
-  }
-
-  function ctxColor(pct: number): string {
-    if (pct >= 90) return "#ef4444";
-    if (pct >= 75) return "#f97316";
-    if (pct >= 50) return "#facc15";
-    return "#4ade80";
-  }
-
-  // Popover never shows soft-hidden sessions — dashboard is the place to
-  // manage / unhide them.
+  // --- derived ----------------------------------------------------------
   const shownSessions = $derived(sessions.filter((s) => !hidden.has(s.session_id)));
   const liveSessions = $derived(
     shownSessions.filter((s) => s.status === "active" || s.status === "idle"),
   );
-  const inactiveCount = $derived(shownSessions.length - liveSessions.length);
-  const visibleSessions = $derived(showAllSessions ? shownSessions : liveSessions);
-  const totalCost = $derived(
-    shownSessions.reduce((acc, s) => acc + (s.cost_usd ?? 0), 0),
+  const inactiveHidden = $derived(shownSessions.length - liveSessions.length);
+
+  // Sort: active first, then by context % desc (danger-first).
+  const sortedSessions = $derived(
+    [...liveSessions].sort((a, b) => {
+      const rank = (s: Session) => (s.status === "active" ? 0 : 1);
+      if (rank(a) !== rank(b)) return rank(a) - rank(b);
+      return (
+        b.context_tokens / b.context_limit - a.context_tokens / a.context_limit
+      );
+    }),
   );
-  // Names that appear on more than one visible session — we suffix those
-  // with a short UID so the user can tell duplicates apart at a glance.
+
+  // Disambiguate duplicate names with a short UID suffix.
   const dupNames = $derived.by(() => {
     const counts = new Map<string, number>();
-    for (const s of visibleSessions) {
+    for (const s of sortedSessions) {
       if (s.name) counts.set(s.name, (counts.get(s.name) ?? 0) + 1);
     }
     const out = new Set<string>();
@@ -238,707 +145,976 @@
   });
 
   function displayName(s: Session): string {
-    if (!s.name) return short(s.session_id);
-    if (dupNames.has(s.name)) return `${s.name} #${short(s.session_id)}`;
+    if (!s.name) return s.session_id.slice(0, 8);
+    if (dupNames.has(s.name)) return `${s.name} #${s.session_id.slice(0, 8)}`;
     return s.name;
   }
+
   const activeBlock = $derived(blocks.find((b) => b.is_active));
-  // Drop gap blocks (no usage data) and sort done blocks most-recent-first.
-  const doneBlocks = $derived(
+  const recentBlocks = $derived(
     blocks
-      .filter((b) => !b.is_gap && !b.is_active)
-      .sort((a, b) => b.start_ms - a.start_ms),
+      .filter((b) => !b.is_active && !b.is_gap)
+      .sort((a, b) => b.start_ms - a.start_ms)
+      .slice(0, 5),
   );
-  const visibleDoneBlocks = $derived(
-    showAllBlocks ? doneBlocks : doneBlocks.slice(0, DONE_BLOCKS_DEFAULT),
-  );
-  const hiddenDoneCount = $derived(
-    Math.max(0, doneBlocks.length - DONE_BLOCKS_DEFAULT),
-  );
+
+  // Hero derivations.
+  const heroBlock = $derived(activeBlock);
+  const heroBurnSeries = $derived(synthBurnSeries(heroBlock?.burn_usd_per_hr ?? 0));
+  const heroProgress = $derived.by(() => {
+    if (!heroBlock) return 0;
+    const elapsed = now - heroBlock.start_ms;
+    const total = heroBlock.end_ms - heroBlock.start_ms;
+    return Math.min(100, Math.max(0, (elapsed / total) * 100));
+  });
+  const heroRemaining = $derived(heroBlock ? heroBlock.end_ms - now : 0);
 </script>
 
-<main>
-  <header>
-    <div class="brand">
-      <h1>Tokenscope</h1>
-      <span class="stats">
-        ${totalCost.toFixed(2)} total · {liveSessions.length} live · {shownSessions.length} sessions
-      </span>
-    </div>
-    <div class="header-actions">
-      <button class="icon-btn" onclick={openDashboard} title="Open Dashboard">⛶</button>
-      <button class="icon-btn" onclick={load} disabled={loading} title="Refresh">↻</button>
-    </div>
-  </header>
+<div class="ts-popover" data-popover-root>
+  {#if heroBlock}
+    {@const burnHot = heroBlock.burn_usd_per_hr >= 0.5}
+    <div class="ts-hero">
+      <div class="ts-hero-top">
+        <div class="ts-hero-block">
+          <div class="ts-hero-label">CURRENT BLOCK</div>
+          <div class="ts-hero-cost ts-tnum">{fmtUSD(heroBlock.cost_usd)}</div>
+          <div class="ts-hero-proj ts-tnum">
+            est. {fmtUSD(heroBlock.projected_block_usd)}
+          </div>
+        </div>
+        <div class="ts-hero-burn">
+          <div class="ts-hero-label ts-hero-label-r">BURN RATE</div>
+          <div class="ts-hero-sparkrow">
+            <Sparkline
+              data={heroBurnSeries}
+              width={120}
+              height={30}
+              stroke={burnHot ? "var(--ts-accent)" : "var(--ts-text-3)"}
+            />
+          </div>
+          <div
+            class="ts-hero-burnval-sm ts-tnum"
+            style="color:{burnHot ? 'var(--ts-burn-hot)' : 'var(--ts-text-2)'};"
+          >
+            {fmtUSD(heroBlock.burn_usd_per_hr)}<span class="ts-hero-unit">/hr</span>
+          </div>
+        </div>
+      </div>
 
-  <nav class="tabs">
-    <button class:active={tab === "sessions"} onclick={() => (tab = "sessions")}>Sessions</button>
-    <button class:active={tab === "blocks"} onclick={() => (tab = "blocks")}>
-      Blocks{activeBlock ? ` · $${activeBlock.cost_usd.toFixed(2)}` : ""}
-    </button>
-    <button class:active={tab === "settings"} onclick={() => (tab = "settings")}>Settings</button>
+      <div class="ts-hero-reset">
+        <div class="ts-hero-resetbar">
+          <div class="ts-hero-resetfill" style="width:{heroProgress}%;"></div>
+        </div>
+        <div class="ts-hero-resetmeta">
+          <span>{liveSessions.length} live</span>
+          <span class="ts-tnum">resets in {fmtDuration(heroRemaining)}</span>
+        </div>
+      </div>
+    </div>
+  {:else}
+    <div class="ts-hero ts-hero-empty">
+      <div class="ts-hero-label">CURRENT BLOCK</div>
+      <div class="ts-hero-cost ts-tnum">—</div>
+      <div class="ts-hero-proj">No active block.</div>
+    </div>
+  {/if}
+
+  <nav class="ts-pop-tabs">
+    <button
+      class="ts-tab"
+      class:is-on={tab === "sessions"}
+      onclick={() => (tab = "sessions")}
+    >Sessions</button>
+    <button
+      class="ts-tab"
+      class:is-on={tab === "blocks"}
+      onclick={() => (tab = "blocks")}
+    >Blocks</button>
+    <button
+      class="ts-tab"
+      class:is-on={tab === "settings"}
+      onclick={() => (tab = "settings")}
+    >Settings</button>
   </nav>
 
-  {#if loading}
-    <p class="empty">Loading…</p>
-  {:else if error}
-    <p class="error">{error}</p>
-  {:else if tab === "sessions"}
-    {#if visibleSessions.length === 0}
-      <p class="empty">
-        {sessions.length === 0
-          ? "No sessions found."
-          : "No live sessions. Inactive only."}
-        {#if !showAllSessions && inactiveCount > 0}
-          <button class="link" onclick={() => (showAllSessions = true)}>
-            Show {inactiveCount} inactive
-          </button>
-        {/if}
-      </p>
-    {:else}
-      <ul class="session-list">
-        {#each visibleSessions as s (s.session_id)}
-          {@const open = expandedId === s.session_id}
-          {@const pct = ctxPct(s)}
-          <li class="session-card" class:open>
-            <button
-              type="button"
-              class="card-trigger"
-              aria-expanded={open}
+  <div class="ts-pop-scroll">
+    {#if loading}
+      <div class="ts-tabbody ts-empty-state">Loading…</div>
+    {:else if error}
+      <div class="ts-tabbody ts-empty-state ts-err">{error}</div>
+    {:else if tab === "sessions"}
+      <div class="ts-tabbody ts-sessions">
+        {#if sortedSessions.length === 0}
+          <div class="ts-empty-state">No live sessions.</div>
+        {:else}
+          {#each sortedSessions as s (s.session_id)}
+            {@const pct = Math.round((s.context_tokens / s.context_limit) * 100)}
+            {@const tier = contextTier(pct)}
+            {@const open = expandedId === s.session_id}
+            {@const subTok = totalTokens(s.subagent_tokens)}
+            <div
+              class="ts-card"
+              class:is-open={open}
               onclick={() => toggleExpand(s.session_id)}
+              role="button"
+              tabindex="0"
+              onkeydown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  toggleExpand(s.session_id);
+                }
+              }}
             >
-              <span class="dot {s.status}"></span>
-              <div class="card-body">
-                <div class="card-line">
-                  <span class="name">{displayName(s)}</span>
-                  <span class="cost">{fmtCost(s.cost_usd)}</span>
+              <div class="ts-card-head">
+                <div class="ts-card-id">
+                  <StatusDot status={s.status} />
+                  <span class="ts-card-name" class:is-mono={!s.name}
+                    >{displayName(s)}</span
+                  >
                 </div>
-                <div class="card-meta">
-                  <span>{repoName(s.cwd)}</span>
-                  <span class="sep">·</span>
-                  <span class="mono">{shortModel(s.model)}</span>
-                  {#if s.subagent_count > 0}
-                    <span class="sep">·</span>
-                    <span>{s.subagent_count} sub</span>
-                  {/if}
-                  <span class="caret">{open ? "▾" : "▸"}</span>
-                </div>
-                {#if s.context_tokens > 0 && s.status !== "inactive"}
-                  <div class="ctx-row">
-                    <div class="ctx-track">
-                      <div
-                        class="ctx-fill"
-                        style="width: {pct}%; background: {ctxColor(pct)};"
-                      ></div>
-                    </div>
-                    <span class="ctx-label" style="color: {ctxColor(pct)};">
-                      {pct.toFixed(0)}% ctx
-                    </span>
-                  </div>
-                {/if}
+                <div class="ts-card-cost ts-tnum">{fmtUSD(s.cost_usd)}</div>
               </div>
-            </button>
-            {#if open}
-              <dl class="card-detail">
-                <dt>UID</dt><dd class="mono">{s.session_id}</dd>
-                <dt>PID</dt><dd class="mono">{s.pid ?? "—"}</dd>
-                <dt>cwd</dt><dd class="mono trunc">{s.cwd ?? "—"}</dd>
-                <dt>model</dt><dd class="mono">{s.model ?? "—"}</dd>
-                <dt>context</dt>
-                <dd class="trunc">
-                  {compact(s.context_tokens)} / {compact(s.context_limit)} ({pct.toFixed(1)}%)
-                </dd>
-                <dt>total in</dt><dd>{compact(s.tokens.input)}</dd>
-                <dt>total out</dt><dd>{compact(s.tokens.output)}</dd>
-                <dt>cache w</dt><dd>{compact(s.tokens.cache_creation)}</dd>
-                <dt>cache r</dt><dd>{compact(s.tokens.cache_read)}</dd>
+
+              <div class="ts-card-ctx">
+                <ContextBar {pct} height={4} />
+                <span
+                  class="ts-card-ctxpct ts-tnum"
+                  style="color:var(--ts-tier-{tier});">{pct}%</span
+                >
+              </div>
+
+              <div class="ts-card-meta">
+                <span class="ts-mono">{repoName(s.cwd)}</span>
+                <span class="ts-meta-dot">·</span>
+                <span>{fmtModel(s.model)}</span>
                 {#if s.subagent_count > 0}
-                  <dt>subagents</dt>
-                  <dd>{s.subagent_count} ({compact(totalTokens(s.subagent_tokens))} tokens)</dd>
+                  <span class="ts-meta-dot">·</span>
+                  <span>{s.subagent_count} sub</span>
                 {/if}
-                <dt>updated</dt><dd>{relativeTime(s.updated_at_ms)}</dd>
-              </dl>
-              <div class="card-actions">
-                <button class="link" onclick={() => hideSession(s.session_id)}>
-                  Hide from popover
-                </button>
+                <span class="ts-card-time">{fmtRelTime(s.updated_at_ms, now)}</span>
               </div>
-            {/if}
-          </li>
-        {/each}
-      </ul>
-      {#if inactiveCount > 0}
-        <div class="footer-row">
-          <button
-            class="link"
-            onclick={() => (showAllSessions = !showAllSessions)}
-          >
-            {showAllSessions
-              ? `Hide ${inactiveCount} inactive`
-              : `Show ${inactiveCount} inactive`}
-          </button>
-        </div>
-      {/if}
-    {/if}
-  {:else if tab === "blocks"}
-    {#if !activeBlock && doneBlocks.length === 0}
-      <p class="empty">No billing blocks yet.</p>
-    {:else}
-      {#if activeBlock}
-        <section class="active-card">
-          <div class="active-head">
-            <span class="badge">ACTIVE 5H BLOCK</span>
-            <span class="reset">resets in {fmtDuration(activeBlock.end_ms - now)}</span>
-          </div>
-          <div class="active-cost">${activeBlock.cost_usd.toFixed(2)}</div>
-          {#if activeBlock.burn_usd_per_hr >= 0.01}
-            <div class="active-burn">
-              <span class="burn-rate">${activeBlock.burn_usd_per_hr.toFixed(2)}/hr</span>
-              <span class="sep">·</span>
-              <span class="proj">est. block ${activeBlock.projected_block_usd.toFixed(2)}</span>
+
+              {#if open}
+                <div
+                  class="ts-card-detail"
+                  onclick={(e) => e.stopPropagation()}
+                  role="presentation"
+                >
+                  <div class="ts-detail-grid">
+                    <div class="ts-tokcol">
+                      <div class="ts-tokcol-title">Session</div>
+                      <div class="ts-tokrow"><span>input</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.tokens.input)}</span></div>
+                      <div class="ts-tokrow"><span>output</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.tokens.output)}</span></div>
+                      <div class="ts-tokrow"><span>cache write</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.tokens.cache_creation)}</span></div>
+                      <div class="ts-tokrow"><span>cache read</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.tokens.cache_read)}</span></div>
+                    </div>
+                    <div class="ts-tokcol" class:is-muted={subTok === 0}>
+                      <div class="ts-tokcol-title">Subagents ({s.subagent_count})</div>
+                      <div class="ts-tokrow"><span>input</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.subagent_tokens.input)}</span></div>
+                      <div class="ts-tokrow"><span>output</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.subagent_tokens.output)}</span></div>
+                      <div class="ts-tokrow"><span>cache write</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.subagent_tokens.cache_creation)}</span></div>
+                      <div class="ts-tokrow"><span>cache read</span><span class="ts-tnum ts-mono">{fmtTokensShort(s.subagent_tokens.cache_read)}</span></div>
+                    </div>
+                  </div>
+                  <div class="ts-detail-rows">
+                    <div class="ts-drow"><span class="ts-drow-k">Context</span><span class="ts-drow-v ts-tnum" style="color:var(--ts-tier-{tier});">{fmtTokensFull(s.context_tokens)} / {fmtTokensShort(s.context_limit)}</span></div>
+                    <div class="ts-drow"><span class="ts-drow-k">Model</span><span class="ts-drow-v ts-mono">{s.model ?? "—"}</span></div>
+                    <div class="ts-drow"><span class="ts-drow-k">Cost</span><span class="ts-drow-v ts-tnum">{fmtUSD(s.cost_usd)}</span></div>
+                    <div class="ts-drow"><span class="ts-drow-k">Updated</span><span class="ts-drow-v ts-tnum">{fmtRelTime(s.updated_at_ms, now)}</span></div>
+                    <div class="ts-drow"><span class="ts-drow-k">Path</span><span class="ts-drow-v ts-mono is-ellipsis" title={s.cwd ?? ""}>{s.cwd ?? "—"}</span></div>
+                    <div class="ts-drow"><span class="ts-drow-k">PID</span><span class="ts-drow-v ts-mono ts-tnum">{s.pid ?? "—"}</span></div>
+                    <div class="ts-drow"><span class="ts-drow-k">UID</span><span class="ts-drow-v ts-mono is-ellipsis" title={s.session_id}>{s.session_id}</span></div>
+                  </div>
+                </div>
+              {/if}
+            </div>
+          {/each}
+          {#if inactiveHidden > 0}
+            <div class="ts-sessions-foot">
+              {inactiveHidden} inactive session{inactiveHidden !== 1 ? "s" : ""}
+              hidden · open dashboard to manage
             </div>
           {/if}
-          <div class="active-meta">
-            <span>{fmtTime(activeBlock.start_ms)}–{fmtTime(activeBlock.end_ms)}</span>
-            <span>·</span>
-            <span>{activeBlock.message_count} msgs</span>
-            <span>·</span>
-            <span>{compact(totalTokens(activeBlock.tokens))} tokens</span>
-            <span>·</span>
-            <span class="mono">{shortModel(activeBlock.models[0] ?? null)}</span>
-          </div>
-        </section>
-      {/if}
-
-      {#if doneBlocks.length > 0}
-        <h2 class="section-title">Recent blocks</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>WINDOW</th>
-              <th class="num">MSGS</th><th class="num">TOTAL</th>
-              <th class="num">COST</th><th>MODEL</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each visibleDoneBlocks as b (b.start_ms)}
-              <tr>
-                <td class="mono">
-                  {fmtDate(b.start_ms)} {fmtTime(b.start_ms)}–{fmtTime(b.end_ms)}
-                </td>
-                <td class="num">{b.message_count}</td>
-                <td class="num">{compact(totalTokens(b.tokens))}</td>
-                <td class="num">{fmtCost(b.cost_usd)}</td>
-                <td class="mono">{shortModel(b.models[0] ?? null)}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-        {#if hiddenDoneCount > 0}
-          <div class="footer-row">
-            <button
-              class="link"
-              onclick={() => (showAllBlocks = !showAllBlocks)}
-            >
-              {showAllBlocks
-                ? `Hide ${hiddenDoneCount} older`
-                : `Show ${hiddenDoneCount} older`}
-            </button>
+        {/if}
+      </div>
+    {:else if tab === "blocks"}
+      <div class="ts-tabbody">
+        {#if activeBlock}
+          {@const burnHot = activeBlock.burn_usd_per_hr >= 0.5}
+          {@const elapsed = now - activeBlock.start_ms}
+          {@const total = activeBlock.end_ms - activeBlock.start_ms}
+          {@const progress = Math.min(100, Math.max(0, (elapsed / total) * 100))}
+          {@const remaining = activeBlock.end_ms - now}
+          <div class="ts-activeblock">
+            <div class="ts-ab-head">
+              <span class="ts-ab-live"
+                ><span class="ts-ab-livedot"></span>ACTIVE BLOCK</span
+              >
+              <span class="ts-ab-window ts-tnum"
+                >{fmtClock(activeBlock.start_ms)} – {fmtClock(activeBlock.end_ms)}</span
+              >
+            </div>
+            <div class="ts-ab-costrow">
+              <div class="ts-ab-cost ts-tnum">{fmtUSD(activeBlock.cost_usd)}</div>
+              <div class="ts-ab-proj">
+                <div class="ts-ab-projval ts-tnum">
+                  {fmtUSD(activeBlock.projected_block_usd)}
+                </div>
+                <div class="ts-ab-projlbl">projected total</div>
+              </div>
+            </div>
+            <div class="ts-ab-resetbar">
+              <div class="ts-ab-resetfill" style="width:{progress}%;"></div>
+            </div>
+            <div class="ts-ab-resetmeta ts-tnum">
+              <span>{Math.round(progress)}% elapsed</span>
+              <span>resets in {fmtDuration(remaining)}</span>
+            </div>
+            <div class="ts-ab-stats">
+              <div class="ts-ab-stat">
+                <div class="ts-ab-statlbl">BURN</div>
+                <Sparkline
+                  data={synthBurnSeries(activeBlock.burn_usd_per_hr)}
+                  width={120}
+                  height={28}
+                  stroke={burnHot ? "var(--ts-accent)" : "var(--ts-text-3)"}
+                />
+                <div class="ts-ab-statval-sm ts-tnum">
+                  {fmtUSD(activeBlock.burn_usd_per_hr)}/hr
+                </div>
+              </div>
+              <div class="ts-ab-stat">
+                <div class="ts-ab-statlbl">MESSAGES</div>
+                <div class="ts-ab-statval ts-tnum">{activeBlock.message_count}</div>
+                <div class="ts-ab-statval-sm ts-tnum">
+                  {fmtTokensShort(totalTokens(activeBlock.tokens))} tok
+                </div>
+              </div>
+              <div class="ts-ab-stat">
+                <div class="ts-ab-statlbl">MODELS</div>
+                <div class="ts-ab-models">
+                  {#each activeBlock.models as m}
+                    <span class="ts-modeltag">{fmtModel(m)}</span>
+                  {/each}
+                </div>
+              </div>
+            </div>
           </div>
         {/if}
-      {/if}
-    {/if}
-  {:else if tab === "settings"}
-    <section class="settings">
-      <label class="field">
-        <span class="label">Budget alert threshold (USD per 5h block)</span>
-        <span class="hint">
-          Notify when the current billing block crosses this amount. Set to 0 to disable.
-        </span>
-        <div class="input-row">
-          <input
-            type="number"
-            min="0"
-            step="0.5"
-            bind:value={settings.budget_window_usd}
-          />
-          <button onclick={saveSettings} class="save">
-            {savedFlash ? "Saved ✓" : "Save"}
-          </button>
+
+        {#if recentBlocks.length > 0}
+          <div class="ts-section-label">RECENT BLOCKS</div>
+          <div class="ts-blocktable">
+            <div class="ts-bt-head">
+              <span>window</span>
+              <span class="ts-tnum ts-bt-r">msgs</span>
+              <span class="ts-bt-r">tokens</span>
+              <span class="ts-bt-r">cost</span>
+            </div>
+            {#each recentBlocks as b (b.start_ms)}
+              <div class="ts-bt-row">
+                <span class="ts-mono ts-tnum"
+                  >{fmtClock(b.start_ms)}–{fmtClock(b.end_ms)}</span
+                >
+                <span class="ts-tnum ts-bt-r">{b.message_count}</span>
+                <span class="ts-tnum ts-bt-r ts-text2"
+                  >{fmtTokensShort(totalTokens(b.tokens))}</span
+                >
+                <span class="ts-tnum ts-bt-r ts-bt-cost">{fmtUSD(b.cost_usd)}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        {#if !activeBlock && recentBlocks.length === 0}
+          <div class="ts-empty-state">No billing blocks yet.</div>
+        {/if}
+      </div>
+    {:else if tab === "settings"}
+      <div class="ts-tabbody ts-settings">
+        <div class="ts-set-field">
+          <label class="ts-set-label" for="budget-input"
+            >Budget alert threshold</label
+          >
+          <div class="ts-set-inputrow">
+            <span class="ts-set-prefix">$</span>
+            <input
+              id="budget-input"
+              class="ts-set-input ts-tnum"
+              type="number"
+              min="0"
+              step="1"
+              bind:value={settings.budget_window_usd}
+              onchange={saveSettings}
+            />
+            <span class="ts-set-suffix">/ 5h block</span>
+          </div>
+          <div class="ts-set-hint">
+            Notify when projected block cost crosses this.
+            <span class="ts-mono">0</span> disables alerts.
+          </div>
         </div>
-      </label>
 
-      <div class="field">
-        <span class="label">Pricing overrides</span>
-        <span class="hint">
-          Edit <code>~/.config/tokenscope/pricing.toml</code> to override per-million USD
-          rates per model. Defaults follow Anthropic's published pricing.
-        </span>
-      </div>
+        <div class="ts-set-divider"></div>
 
-      <div class="field">
-        <span class="label">Data source</span>
-        <span class="hint">
-          Reads <code>~/.claude/sessions</code> and <code>~/.claude/projects</code>.
-          Refreshes are filesystem-driven (~2s debounce).
-        </span>
+        <div class="ts-set-note">
+          <Icon name="folder" size={14} />
+          <div>
+            <div class="ts-set-note-k">Pricing source</div>
+            <div class="ts-set-note-v ts-mono">~/.config/tokenscope/pricing.toml</div>
+          </div>
+        </div>
+        <div class="ts-set-note">
+          <Icon name="cpu" size={14} />
+          <div>
+            <div class="ts-set-note-k">Data source</div>
+            <div class="ts-set-note-v ts-mono">
+              ~/.claude/ · local only, never uploaded
+            </div>
+          </div>
+        </div>
       </div>
-    </section>
-  {/if}
-</main>
+    {/if}
+  </div>
+
+  <div class="ts-pop-foot">
+    <button
+      class="ts-foot-btn"
+      onclick={() => load(false)}
+      disabled={loading}
+      title="Refresh"
+    >
+      <Icon name="refresh" size={13} />
+      updated {fmtRelTime(lastLoadedAt, now)}
+    </button>
+    <button class="ts-foot-btn ts-foot-primary" onclick={openDashboard}>
+      <Icon name="expand" size={13} />
+      Dashboard
+    </button>
+  </div>
+</div>
 
 <style>
-  :global(html, body) {
-    margin: 0;
-    padding: 0;
-    background: #1a1a1a;
-    color: #e0e0e0;
-    font-family:
-      -apple-system,
-      BlinkMacSystemFont,
-      "SF Pro Text",
-      sans-serif;
+  .ts-popover {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    background: var(--ts-bg-popover);
+    color: var(--ts-text-1);
     font-size: 13px;
-    line-height: 1.4;
-  }
-
-  main {
-    padding: 14px 16px 16px;
-  }
-
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 10px;
-    padding-bottom: 10px;
-    border-bottom: 1px solid #2a2a2a;
-  }
-
-  .brand {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    overflow: hidden;
   }
 
-  h1 {
-    margin: 0;
-    font-size: 18px;
+  /* hero */
+  .ts-hero {
+    padding: 16px 18px 14px;
+    border-bottom: 1px solid var(--ts-border);
+    flex-shrink: 0;
+  }
+  .ts-hero-empty {
+    color: var(--ts-text-2);
+  }
+  .ts-hero-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+  }
+  .ts-hero-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    color: var(--ts-text-3);
+    margin-bottom: 4px;
+  }
+  .ts-hero-label-r {
+    text-align: right;
+  }
+  .ts-hero-cost {
+    font-size: 34px;
+    font-weight: 650;
+    line-height: 1;
+    letter-spacing: -0.5px;
+  }
+  .ts-hero-proj {
+    font-size: 12px;
+    color: var(--ts-text-2);
+    margin-top: 5px;
+  }
+  .ts-hero-burn {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    min-width: 130px;
+  }
+  .ts-hero-sparkrow {
+    margin-top: 2px;
+  }
+  .ts-hero-burnval-sm {
+    font-size: 13px;
+    font-weight: 600;
+    margin-top: 4px;
+    align-self: flex-end;
+  }
+  .ts-hero-unit {
+    font-size: 0.62em;
+    color: var(--ts-text-3);
+    font-weight: 500;
+    margin-left: 1px;
+  }
+  .ts-hero-reset {
+    margin-top: 14px;
+  }
+  .ts-hero-resetbar {
+    height: 4px;
+    border-radius: 3px;
+    background: var(--ts-surface);
+    overflow: hidden;
+  }
+  .ts-hero-resetfill {
+    height: 100%;
+    border-radius: 3px;
+    background: linear-gradient(
+      90deg,
+      var(--ts-accent),
+      color-mix(in oklab, var(--ts-accent), white 18%)
+    );
+  }
+  .ts-hero-resetmeta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--ts-text-2);
+    margin-top: 6px;
+  }
+
+  /* tabs */
+  .ts-pop-tabs {
+    display: flex;
+    gap: 2px;
+    padding: 8px 12px 0;
+    border-bottom: 1px solid var(--ts-border);
+    flex-shrink: 0;
+  }
+  .ts-tab {
+    appearance: none;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    font-family: var(--ts-font);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ts-text-2);
+    padding: 7px 12px 9px;
+    position: relative;
+    border-radius: 6px 6px 0 0;
+    transition: color 0.12s;
+  }
+  .ts-tab:hover {
+    color: var(--ts-text-1);
+  }
+  .ts-tab.is-on {
+    color: var(--ts-text-1);
     font-weight: 600;
   }
-
-  .stats {
-    font-size: 11px;
-    color: #888;
-    font-variant-numeric: tabular-nums;
+  .ts-tab.is-on::after {
+    content: "";
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: -1px;
+    height: 2px;
+    border-radius: 2px;
+    background: var(--ts-accent);
   }
 
-  .icon-btn,
-  .save,
-  .tabs button {
-    background: #2a2a2a;
-    border: 1px solid #3a3a3a;
-    color: #e0e0e0;
-    padding: 6px 12px;
+  /* scroll body */
+  .ts-pop-scroll {
+    flex: 1;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .ts-pop-scroll::-webkit-scrollbar {
+    width: 9px;
+  }
+  .ts-pop-scroll::-webkit-scrollbar-thumb {
+    background: var(--ts-border-2);
     border-radius: 6px;
-    cursor: pointer;
+    border: 2px solid var(--ts-bg-popover);
+  }
+  .ts-tabbody {
+    padding: 12px;
+  }
+  .ts-empty-state {
+    padding: 30px 12px;
+    text-align: center;
+    color: var(--ts-text-3);
     font-size: 13px;
-    transition: background 0.15s;
   }
-  .icon-btn:hover,
-  .save:hover,
-  .tabs button:hover {
-    background: #3a3a3a;
+  .ts-err {
+    color: var(--ts-tier-critical);
   }
-  .icon-btn:disabled,
-  .save:disabled {
+
+  /* footer */
+  .ts-pop-foot {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    border-top: 1px solid var(--ts-border);
+    background: var(--ts-surface-2);
+    flex-shrink: 0;
+  }
+  .ts-foot-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-family: var(--ts-font);
+    font-size: 12px;
+    color: var(--ts-text-2);
+    padding: 4px 8px;
+    border-radius: 6px;
+    transition: 0.12s;
+  }
+  .ts-foot-btn:hover {
+    background: var(--ts-surface-hi);
+    color: var(--ts-text-1);
+  }
+  .ts-foot-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
   }
-
-  .tabs {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 12px;
+  .ts-foot-primary {
+    color: var(--ts-text-1);
+    font-weight: 550;
   }
-  .tabs button {
-    flex: 1;
-    padding: 6px 8px;
-    font-size: 12px;
-  }
-  .tabs button.active {
-    background: #3a3a3a;
-    border-color: #4a4a4a;
-    color: #fff;
+  .ts-foot-primary:hover {
+    background: var(--ts-accent-weak);
+    color: var(--ts-accent);
   }
 
-  .empty,
-  .error {
-    text-align: center;
-    color: #888;
-    padding: 32px;
-  }
-  .error {
-    color: #ff6b6b;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-variant-numeric: tabular-nums;
-  }
-
-  th,
-  td {
-    padding: 6px 8px;
-    text-align: left;
-    border-bottom: 1px solid #2a2a2a;
-    white-space: nowrap;
-    max-width: 220px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  th {
-    font-weight: 600;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: #888;
-  }
-
-  th.num,
-  td.num {
-    text-align: right;
-  }
-
-  .mono {
-    font-family: "SF Mono", Menlo, monospace;
-    font-size: 11px;
-  }
-
-  .settings {
+  /* sessions cards */
+  .ts-sessions {
     display: flex;
     flex-direction: column;
-    gap: 18px;
-    padding-top: 4px;
+    gap: 7px;
   }
-
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .label {
-    font-size: 12px;
-    font-weight: 600;
-    color: #ddd;
-  }
-
-  .hint {
-    font-size: 11px;
-    color: #888;
-    line-height: 1.5;
-  }
-
-  .hint code {
-    background: #2a2a2a;
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-size: 10.5px;
-  }
-
-  .input-row {
-    display: flex;
-    gap: 8px;
-    margin-top: 6px;
-  }
-
-  input[type="number"] {
-    flex: 1;
-    background: #0e0e0e;
-    border: 1px solid #3a3a3a;
-    color: #e0e0e0;
-    padding: 6px 10px;
-    border-radius: 6px;
-    font-size: 13px;
-    font-variant-numeric: tabular-nums;
-  }
-  input[type="number"]:focus {
-    outline: none;
-    border-color: #4ade80;
-  }
-
-  .footer-row {
-    text-align: center;
-    padding: 10px 0 0;
-  }
-
-  .link {
-    background: none;
-    border: none;
-    color: #888;
-    font-size: 11px;
+  .ts-card {
+    background: var(--ts-surface-2);
+    border: 1px solid var(--ts-border);
+    border-radius: 9px;
+    padding: 11px 12px;
     cursor: pointer;
-    padding: 4px 8px;
-    border-radius: 4px;
+    transition: background 0.12s, border-color 0.12s;
   }
-  .link:hover {
-    color: #ddd;
-    background: #2a2a2a;
+  .ts-card:hover {
+    background: var(--ts-surface);
+    border-color: var(--ts-border-2);
   }
-
-  .active-card {
-    background: linear-gradient(135deg, #1e2a1e 0%, #1a2a22 100%);
-    border: 1px solid #2d4a2d;
-    border-radius: 8px;
-    padding: 14px 16px;
-    margin-bottom: 14px;
+  .ts-card.is-open {
+    background: var(--ts-surface);
+    border-color: var(--ts-accent-line);
   }
-
-  .active-head {
+  .ts-card-head {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    margin-bottom: 6px;
-  }
-
-  .badge {
-    font-size: 9.5px;
-    font-weight: 700;
-    letter-spacing: 1px;
-    color: #4ade80;
-    background: rgba(74, 222, 128, 0.12);
-    padding: 3px 7px;
-    border-radius: 4px;
-  }
-
-  .reset {
-    font-size: 11px;
-    color: #aaa;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .active-cost {
-    font-size: 28px;
-    font-weight: 700;
-    color: #4ade80;
-    font-variant-numeric: tabular-nums;
-    line-height: 1.1;
-    margin: 4px 0 8px;
-  }
-
-  .active-burn {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-bottom: 6px;
-    font-size: 12px;
-    font-variant-numeric: tabular-nums;
-  }
-  .burn-rate {
-    color: #facc15;
-    font-weight: 600;
-  }
-  .proj {
-    color: #ccc;
-  }
-
-  .active-meta {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-    font-size: 11px;
-    color: #999;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .section-title {
-    margin: 4px 0 8px;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: #888;
-    font-weight: 600;
-  }
-
-  .session-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .session-card {
-    border-radius: 6px;
-    transition: background 0.12s;
-  }
-  .session-card.open {
-    background: #232323;
-  }
-
-  .card-trigger {
-    width: 100%;
-    background: none;
-    border: none;
-    color: inherit;
-    cursor: pointer;
-    text-align: left;
-    padding: 8px 10px;
-    border-radius: 6px;
-    display: grid;
-    grid-template-columns: 14px 1fr;
-    gap: 8px;
-    align-items: start;
-    font: inherit;
-  }
-  .card-trigger:hover {
-    background: #232323;
-  }
-  .session-card.open .card-trigger:hover {
-    background: transparent;
-  }
-
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    margin-top: 6px;
-    background: #555;
-  }
-  .dot.active {
-    background: #4ade80;
-    box-shadow: 0 0 6px rgba(74, 222, 128, 0.5);
-  }
-  .dot.idle {
-    background: #facc15;
-  }
-  .dot.inactive {
-    background: #555;
-  }
-
-  .card-body {
-    min-width: 0;
-  }
-
-  .card-line {
-    display: flex;
-    align-items: baseline;
     justify-content: space-between;
     gap: 10px;
   }
-
-  .name {
-    font-size: 13px;
-    font-weight: 500;
-    color: #e8e8e8;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    min-width: 0;
-  }
-
-  .cost {
-    font-size: 13px;
-    font-weight: 600;
-    color: #e0e0e0;
-    font-variant-numeric: tabular-nums;
-    flex-shrink: 0;
-  }
-
-  .card-meta {
-    margin-top: 2px;
-    font-size: 11px;
-    color: #888;
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  .ts-card-id {
     display: flex;
-    gap: 5px;
     align-items: center;
+    gap: 9px;
     min-width: 0;
   }
-
-  .sep {
-    color: #555;
+  .ts-card-name {
+    font-weight: 550;
+    font-size: 13.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-
-  .caret {
+  .ts-card-name.is-mono {
+    font-family: var(--ts-mono);
+    color: var(--ts-text-2);
+    font-size: 12.5px;
+  }
+  .ts-card-cost {
+    font-weight: 600;
+    font-size: 14px;
+  }
+  .ts-card-ctx {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin-top: 9px;
+  }
+  .ts-card-ctxpct {
+    font-size: 11px;
+    font-weight: 600;
+    width: 30px;
+    text-align: right;
+  }
+  .ts-card-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+    font-size: 11.5px;
+    color: var(--ts-text-2);
+  }
+  .ts-card-meta .ts-mono {
+    color: var(--ts-text-2);
+  }
+  .ts-meta-dot {
+    color: var(--ts-text-3);
+  }
+  .ts-card-time {
     margin-left: auto;
-    color: #666;
-    font-size: 10px;
+    color: var(--ts-text-3);
+  }
+  .ts-sessions-foot {
+    text-align: center;
+    font-size: 11.5px;
+    color: var(--ts-text-3);
+    padding: 10px 4px 4px;
   }
 
-  .card-detail {
-    margin: 0;
-    padding: 8px 12px 12px 32px;
+  /* card detail */
+  .ts-card-detail {
+    margin-top: 11px;
+    padding-top: 11px;
+    border-top: 1px solid var(--ts-border);
+    cursor: default;
+    animation: ts-fadein 0.14s ease;
+  }
+  @keyframes ts-fadein {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  .ts-detail-grid {
     display: grid;
-    grid-template-columns: 60px 1fr 60px 1fr;
-    gap: 4px 10px;
-    border-top: 1px solid #2a2a2a;
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 16px;
   }
-  .card-detail dt {
-    color: #777;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    font-size: 9.5px;
-    align-self: center;
-  }
-  .card-detail dd {
-    margin: 0;
-    color: #ddd;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .card-detail .trunc {
-    grid-column: 2 / -1;
-  }
-
-  .ctx-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 5px;
-  }
-
-  .ctx-track {
-    flex: 1;
-    height: 4px;
-    background: #2a2a2a;
-    border-radius: 2px;
-    overflow: hidden;
-    min-width: 0;
-  }
-
-  .ctx-fill {
-    height: 100%;
-    border-radius: 2px;
-    transition: width 0.2s, background 0.2s;
-  }
-
-  .ctx-label {
+  .ts-tokcol-title {
     font-size: 10px;
     font-weight: 600;
-    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.4px;
+    color: var(--ts-text-3);
+    margin-bottom: 5px;
+  }
+  .ts-tokcol.is-muted {
+    opacity: 0.4;
+  }
+  .ts-tokrow {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11.5px;
+    color: var(--ts-text-2);
+    padding: 1.5px 0;
+  }
+  .ts-tokrow .ts-mono {
+    color: var(--ts-text-1);
+  }
+  .ts-detail-rows {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .ts-drow {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 11.5px;
+    padding: 2px 0;
+  }
+  .ts-drow-k {
+    color: var(--ts-text-3);
     flex-shrink: 0;
   }
-
-  .header-actions {
-    display: flex;
-    gap: 6px;
+  .ts-drow-v {
+    color: var(--ts-text-1);
+    text-align: right;
+  }
+  .ts-drow-v.is-ellipsis {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 230px;
+    direction: rtl;
   }
 
-  .card-actions {
-    padding: 0 12px 10px 32px;
+  /* active block */
+  .ts-activeblock {
+    background: var(--ts-surface-2);
+    border: 1px solid var(--ts-border);
+    border-radius: 11px;
+    padding: 15px 16px;
+  }
+  .ts-ab-head {
     display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .ts-ab-live {
+    display: flex;
+    align-items: center;
     gap: 6px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    color: var(--ts-st-active);
+  }
+  .ts-ab-livedot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--ts-st-active);
+    box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.5);
+    animation: ts-livepulse 2s infinite;
+  }
+  @keyframes ts-livepulse {
+    0% {
+      box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.45);
+    }
+    70% {
+      box-shadow: 0 0 0 6px rgba(74, 222, 128, 0);
+    }
+    100% {
+      box-shadow: 0 0 0 0 rgba(74, 222, 128, 0);
+    }
+  }
+  .ts-ab-window {
+    font-size: 11.5px;
+    color: var(--ts-text-2);
+  }
+  .ts-ab-costrow {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    margin-top: 10px;
+  }
+  .ts-ab-cost {
+    font-size: 40px;
+    font-weight: 650;
+    line-height: 1;
+    letter-spacing: -0.6px;
+  }
+  .ts-ab-proj {
+    text-align: right;
+  }
+  .ts-ab-projval {
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--ts-text-1);
+  }
+  .ts-ab-projlbl {
+    font-size: 10.5px;
+    color: var(--ts-text-3);
+    margin-top: 2px;
+  }
+  .ts-ab-resetbar {
+    height: 5px;
+    border-radius: 3px;
+    background: var(--ts-surface-hi);
+    overflow: hidden;
+    margin-top: 14px;
+  }
+  .ts-ab-resetfill {
+    height: 100%;
+    border-radius: 3px;
+    background: linear-gradient(
+      90deg,
+      var(--ts-accent),
+      color-mix(in oklab, var(--ts-accent), white 20%)
+    );
+  }
+  .ts-ab-resetmeta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--ts-text-2);
+    margin-top: 6px;
+  }
+  .ts-ab-stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 10px;
+    margin-top: 16px;
+    padding-top: 14px;
+    border-top: 1px solid var(--ts-border);
+  }
+  .ts-ab-stat {
+    min-width: 0;
+  }
+  .ts-ab-statlbl {
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: var(--ts-text-3);
+    margin-bottom: 6px;
+  }
+  .ts-ab-statval {
+    font-size: 18px;
+    font-weight: 600;
+  }
+  .ts-ab-statval-sm {
+    font-size: 10.5px;
+    color: var(--ts-text-3);
+    margin-top: 3px;
+  }
+  .ts-ab-models {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .ts-modeltag {
+    font-family: var(--ts-mono);
+    font-size: 10.5px;
+    padding: 2px 6px;
+    border-radius: 5px;
+    background: var(--ts-surface-hi);
+    color: var(--ts-text-2);
+    white-space: nowrap;
+  }
+
+  .ts-section-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: var(--ts-text-3);
+    margin: 18px 4px 8px;
+  }
+  .ts-blocktable {
+    display: flex;
+    flex-direction: column;
+  }
+  .ts-bt-head {
+    display: grid;
+    grid-template-columns: 1.6fr 0.7fr 0.9fr 0.9fr;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    color: var(--ts-text-3);
+    padding: 0 6px 7px;
+  }
+  .ts-bt-r {
+    text-align: right;
+  }
+  .ts-bt-row {
+    display: grid;
+    grid-template-columns: 1.6fr 0.7fr 0.9fr 0.9fr;
+    font-size: 12px;
+    padding: 8px 6px;
+    border-radius: 6px;
+    align-items: center;
+  }
+  .ts-bt-row:hover {
+    background: var(--ts-surface-2);
+  }
+  .ts-bt-row:not(:last-child) {
+    border-bottom: 1px solid var(--ts-border);
+  }
+  .ts-bt-cost {
+    font-weight: 600;
+  }
+  .ts-text2 {
+    color: var(--ts-text-2);
+  }
+
+  /* settings */
+  .ts-settings {
+    padding: 16px;
+  }
+  .ts-set-label {
+    display: block;
+    font-size: 13px;
+    font-weight: 550;
+    margin-bottom: 9px;
+  }
+  .ts-set-inputrow {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    background: var(--ts-surface-2);
+    border: 1px solid var(--ts-border-2);
+    border-radius: 8px;
+    padding: 0 12px;
+    height: 38px;
+    max-width: 230px;
+  }
+  .ts-set-inputrow:focus-within {
+    border-color: var(--ts-accent);
+    box-shadow: 0 0 0 3px var(--ts-accent-weak);
+  }
+  .ts-set-prefix {
+    color: var(--ts-text-2);
+    font-size: 15px;
+  }
+  .ts-set-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--ts-text-1);
+    font-family: var(--ts-font);
+    font-size: 15px;
+    font-weight: 550;
+    padding: 0 4px;
+    width: 100%;
+  }
+  .ts-set-suffix {
+    color: var(--ts-text-3);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .ts-set-hint {
+    font-size: 11.5px;
+    color: var(--ts-text-3);
+    margin-top: 8px;
+    line-height: 1.5;
+  }
+  .ts-set-divider {
+    height: 1px;
+    background: var(--ts-border);
+    margin: 20px 0;
+  }
+  .ts-set-note {
+    display: flex;
+    gap: 11px;
+    align-items: flex-start;
+    padding: 9px 0;
+    color: var(--ts-text-2);
+  }
+  .ts-set-note > :global(svg) {
+    margin-top: 1px;
+    color: var(--ts-text-3);
+  }
+  .ts-set-note-k {
+    font-size: 12.5px;
+    color: var(--ts-text-1);
+    font-weight: 500;
+  }
+  .ts-set-note-v {
+    font-size: 11.5px;
+    color: var(--ts-text-2);
+    margin-top: 2px;
+  }
+
+  /* hide number input spinners */
+  .ts-set-input::-webkit-inner-spin-button,
+  .ts-set-input::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
   }
 </style>

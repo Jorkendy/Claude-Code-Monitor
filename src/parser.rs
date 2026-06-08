@@ -30,9 +30,15 @@ pub struct JsonlSummary {
     /// Timestamp (ms) of the event that contributed `latest_context_tokens`.
     /// Used to pick the winner when merging incremental parses.
     pub latest_ts_ms: i64,
+    /// Most recently observed `customTitle` from a `{type:"custom-title"}`
+    /// event. Claude Code writes this when the user runs `/rename`. Survives
+    /// session exit (which removes `sessions/{pid}.json`), so this is the
+    /// only source of name for inactive sessions.
+    pub latest_name: Option<String>,
 }
 
-const NEEDLE: &[u8] = b"\"usage\"";
+const NEEDLE_USAGE: &[u8] = b"\"usage\"";
+const NEEDLE_TITLE: &[u8] = b"\"customTitle\"";
 
 pub fn sum_jsonl(path: &Path, resume_from_offset: u64) -> Result<JsonlSummary> {
     let mut file = File::open(path)?;
@@ -53,6 +59,7 @@ pub fn sum_jsonl(path: &Path, resume_from_offset: u64) -> Result<JsonlSummary> {
         byte_offset: start,
         latest_context_tokens: 0,
         latest_ts_ms: 0,
+        latest_name: None,
     };
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     loop {
@@ -68,12 +75,20 @@ pub fn sum_jsonl(path: &Path, resume_from_offset: u64) -> Result<JsonlSummary> {
             break;
         }
         summary.byte_offset += n as u64;
-        if !contains_subslice(&buf, NEEDLE) {
+        let has_usage = contains_subslice(&buf, NEEDLE_USAGE);
+        let has_title = !has_usage && contains_subslice(&buf, NEEDLE_TITLE);
+        if !has_usage && !has_title {
             continue;
         }
         let Ok(value): serde_json::Result<serde_json::Value> = serde_json::from_slice(&buf) else {
             continue;
         };
+        if has_title {
+            if let Some(t) = value.get("customTitle").and_then(|v| v.as_str()) {
+                summary.latest_name = Some(t.to_string());
+            }
+            continue;
+        }
         let Some(usage) = value.pointer("/message/usage") else {
             continue;
         };
@@ -134,7 +149,7 @@ pub fn events_jsonl(path: &Path, since_ms: i64) -> anyhow::Result<Vec<UsageEvent
         if buf.last() != Some(&b'\n') {
             break;
         }
-        if !contains_subslice(&buf, NEEDLE) {
+        if !contains_subslice(&buf, NEEDLE_USAGE) {
             continue;
         }
         let Ok(v): serde_json::Result<serde_json::Value> = serde_json::from_slice(&buf) else {

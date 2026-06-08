@@ -73,6 +73,13 @@ pub fn join(scan: &ScanResult, cache: &mut CacheFile) -> Result<Vec<SessionRow>>
             entry.context_ts_ms = s.latest_ts_ms;
             entry.context_tokens = s.latest_context_tokens;
         }
+        // Fallback name from transcript: `sessions/{pid}.json` is gone when
+        // the session exits, so for inactive sessions the only place the
+        // user's `/rename` survives is the transcript's `custom-title` event.
+        // Don't override a live session file's name with a stale one though.
+        if entry.name.is_none() {
+            entry.name = s.latest_name;
+        }
         if entry.cwd.is_none() {
             if let Some(slug) = p
                 .parent()
