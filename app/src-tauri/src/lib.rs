@@ -28,6 +28,10 @@ struct Settings {
     /// Used only for subscription plans. 0 disables.
     #[serde(default = "default_rate_warn")]
     rate_limit_warn_pct: f64,
+    /// % of context window that triggers the critical tray warning
+    /// (plan-agnostic). 0 disables.
+    #[serde(default = "default_context_warn")]
+    context_warn_pct: f64,
     /// User-supplied quota override (messages per 5h window). Anthropic
     /// doesn't publish exact numbers; this lets a user lock in what they've
     /// actually measured. Subscription plans only.
@@ -49,6 +53,9 @@ fn default_plan() -> String {
 fn default_rate_warn() -> f64 {
     90.0
 }
+fn default_context_warn() -> f64 {
+    90.0
+}
 fn default_theme() -> String {
     "system".to_string()
 }
@@ -62,6 +69,7 @@ impl Default for Settings {
             budget_window_usd: 5.0,
             plan: default_plan(),
             rate_limit_warn_pct: default_rate_warn(),
+            context_warn_pct: default_context_warn(),
             custom_quota: None,
             theme: default_theme(),
             first_run: true,
@@ -506,15 +514,24 @@ fn tray_state(app: &AppHandle) -> TrayState {
         format!("${:.2}", snap.cost)
     };
 
-    // Critical: any live session ≥ 90% context.
+    // Critical: any session worth warning about at ≥ `context_warn_pct`.
+    // Active always counts; Idle only when it last updated within 30 min —
+    // a session left open from yesterday at 97% is not actionable now.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    const IDLE_RECENT_MS: i64 = 30 * 60 * 1000;
     let sessions = api::list_sessions(None).unwrap_or_default();
     let worst = sessions
         .iter()
-        .filter(|s| {
-            matches!(
-                s.status,
-                tokenscope::model::LiveStatus::Active | tokenscope::model::LiveStatus::Idle
-            )
+        .filter(|s| match s.status {
+            tokenscope::model::LiveStatus::Active => true,
+            tokenscope::model::LiveStatus::Idle => s
+                .updated_at_ms
+                .map(|u| now_ms - u <= IDLE_RECENT_MS)
+                .unwrap_or(false),
+            _ => false,
         })
         .filter_map(|s| {
             if s.context_limit == 0 {
@@ -525,19 +542,19 @@ fn tray_state(app: &AppHandle) -> TrayState {
         })
         .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    if let Some((pct, s)) = worst {
-        if pct >= 0.90 {
-            let name = s
-                .name
-                .clone()
-                .unwrap_or_else(|| s.session_id.chars().take(8).collect());
-            return TrayState {
-                title: format!("⚠ {base}"),
-                tooltip: Some(format!(
-                    "{name} — context {}%",
-                    (pct * 100.0).round() as i64
-                )),
-            };
+    if settings.context_warn_pct > 0.0 {
+        if let Some((pct, s)) = worst {
+            if pct * 100.0 >= settings.context_warn_pct {
+                let name = s
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| s.session_id.chars().take(8).collect());
+                let ctx_pct = (pct * 100.0).round() as i64;
+                return TrayState {
+                    title: format!("⚠ ctx {}% · {}", ctx_pct, base),
+                    tooltip: Some(format!("{name} — context {}%", ctx_pct)),
+                };
+            }
         }
     }
 

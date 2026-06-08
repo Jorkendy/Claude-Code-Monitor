@@ -58,6 +58,7 @@
     budget_window_usd: number;
     plan: Plan;
     rate_limit_warn_pct: number;
+    context_warn_pct: number;
     custom_quota: number | null;
     theme: Theme;
     first_run: boolean;
@@ -85,6 +86,7 @@
     budget_window_usd: 0,
     plan: "api",
     rate_limit_warn_pct: 90,
+    context_warn_pct: 90,
     custom_quota: null,
     theme: "system",
     first_run: true,
@@ -793,6 +795,29 @@
             </div>
           </div>
         {/if}
+
+        <div class="ts-set-field">
+          <label class="ts-set-label" for="ctx-warn-input"
+            >Context warning</label
+          >
+          <div class="ts-set-inputrow">
+            <input
+              id="ctx-warn-input"
+              class="ts-set-input ts-tnum"
+              type="number"
+              min="0"
+              max="100"
+              step="5"
+              bind:value={settings.context_warn_pct}
+              onchange={saveSettings}
+            />
+            <span class="ts-set-suffix">% of window</span>
+          </div>
+          <div class="ts-set-hint">
+            Tray shows <span class="ts-mono">⚠ ctx NN%</span> when any active
+            (or recently-used idle) session reaches this. <span class="ts-mono">0</span> disables.
+          </div>
+        </div>
 
         <div class="ts-set-divider"></div>
 
