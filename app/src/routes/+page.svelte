@@ -132,6 +132,103 @@
     await invoke("open_dashboard");
   }
 
+  // ---- update check ----------------------------------------------------
+  type AppInfo = {
+    version: string;
+    repo_url: string;
+    release_url: string;
+    latest_release_url: string;
+  };
+  type UpdateInfo = {
+    current_version: string;
+    latest_version: string;
+    has_update: boolean;
+    release_notes: string;
+    release_url: string;
+    dmg_url: string | null;
+    dmg_size: number | null;
+  };
+  type UpdateState =
+    | { kind: "idle" }
+    | { kind: "checking" }
+    | { kind: "result"; info: UpdateInfo }
+    | { kind: "downloading"; info: UpdateInfo; downloaded: number; total: number }
+    | { kind: "downloaded"; info: UpdateInfo; path: string }
+    | { kind: "error"; message: string };
+
+  let info: AppInfo | null = $state(null);
+  let updateState: UpdateState = $state({ kind: "idle" });
+  let updateProgressUnlisten: UnlistenFn | undefined;
+
+  async function loadAppInfo() {
+    try {
+      info = await invoke<AppInfo>("app_info");
+    } catch (e) {
+      // non-fatal — fall back to "unknown" in the About row.
+      console.error("app_info failed", e);
+    }
+  }
+
+  async function checkForUpdates() {
+    updateState = { kind: "checking" };
+    try {
+      const r = await invoke<UpdateInfo>("check_update");
+      updateState = { kind: "result", info: r };
+    } catch (e) {
+      updateState = { kind: "error", message: String(e) };
+    }
+  }
+
+  async function downloadUpdate() {
+    if (updateState.kind !== "result" || !updateState.info.dmg_url) return;
+    const target = updateState.info;
+    updateState = {
+      kind: "downloading",
+      info: target,
+      downloaded: 0,
+      total: target.dmg_size ?? 0,
+    };
+    // Re-subscribe each download in case a previous listener was dropped.
+    updateProgressUnlisten?.();
+    updateProgressUnlisten = await listen<{ downloaded: number; total: number }>(
+      "update-progress",
+      (e) => {
+        if (updateState.kind !== "downloading") return;
+        updateState = {
+          ...updateState,
+          downloaded: e.payload.downloaded,
+          total: e.payload.total || updateState.total,
+        };
+      },
+    );
+    try {
+      const r = await invoke<{ path: string }>("download_update", {
+        url: target.dmg_url,
+      });
+      updateState = { kind: "downloaded", info: target, path: r.path };
+    } catch (e) {
+      updateState = { kind: "error", message: String(e) };
+    } finally {
+      updateProgressUnlisten?.();
+      updateProgressUnlisten = undefined;
+    }
+  }
+
+  async function openDownloadedDmg() {
+    if (updateState.kind !== "downloaded") return;
+    try {
+      await invoke("open_path", { path: updateState.path });
+    } catch (e) {
+      updateState = { kind: "error", message: String(e) };
+    }
+  }
+
+  function closeUpdateModal() {
+    updateProgressUnlisten?.();
+    updateProgressUnlisten = undefined;
+    updateState = { kind: "idle" };
+  }
+
   function toggleExpand(id: string) {
     expandedId = expandedId === id ? null : id;
   }
@@ -140,11 +237,13 @@
   let tickHandle: ReturnType<typeof setInterval> | undefined;
   onMount(async () => {
     await load(true);
+    await loadAppInfo();
     unlisten = await listen("data-changed", () => load(false));
     tickHandle = setInterval(() => (now = Date.now()), 30_000);
   });
   onDestroy(() => {
     unlisten?.();
+    updateProgressUnlisten?.();
     if (tickHandle) clearInterval(tickHandle);
   });
 
@@ -265,7 +364,7 @@
   function handleKey(e: KeyboardEvent) {
     const t = e.target as HTMLElement | null;
     if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
-    if (showFirstRun) return;
+    if (showFirstRun || updateState.kind !== "idle") return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     switch (e.key) {
       case "1": tab = "sessions"; break;
@@ -288,6 +387,103 @@
 <svelte:window onkeydown={handleKey} />
 
 <div class="ts-popover" data-popover-root>
+  {#if updateState.kind !== "idle" && updateState.kind !== "checking"}
+    <div class="ts-firstrun-scrim" role="presentation">
+      <div
+        class="ts-firstrun ts-update-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="upd-title"
+      >
+        {#if updateState.kind === "result"}
+          {@const u = updateState.info}
+          <div class="ts-firstrun-title" id="upd-title">
+            {u.has_update
+              ? `Update available — v${u.latest_version}`
+              : "You're up to date"}
+          </div>
+          <div class="ts-firstrun-sub ts-tnum">
+            Current: v{u.current_version}
+            {#if u.has_update}
+              · Latest: v{u.latest_version}
+              {#if u.dmg_size}
+                · {(u.dmg_size / 1024 / 1024).toFixed(1)} MB
+              {/if}
+            {/if}
+          </div>
+          {#if u.has_update && u.release_notes}
+            <div class="ts-update-notes">{u.release_notes}</div>
+          {/if}
+          <div class="ts-update-actions">
+            {#if u.has_update && u.dmg_url}
+              <button class="ts-set-btn ts-btn-primary" onclick={downloadUpdate}
+                >Download</button
+              >
+              <a
+                class="ts-set-btn"
+                href={u.release_url}
+                target="_blank"
+                rel="noreferrer">View on GitHub</a
+              >
+            {:else if u.has_update}
+              <a
+                class="ts-set-btn ts-btn-primary"
+                href={u.release_url}
+                target="_blank"
+                rel="noreferrer">Open release</a
+              >
+            {/if}
+            <button class="ts-set-btn ts-btn-ghost" onclick={closeUpdateModal}
+              >{u.has_update ? "Later" : "Close"}</button
+            >
+          </div>
+        {:else if updateState.kind === "downloading"}
+          {@const u = updateState.info}
+          {@const pct = updateState.total
+            ? Math.min(100, (updateState.downloaded / updateState.total) * 100)
+            : 0}
+          <div class="ts-firstrun-title" id="upd-title">
+            Downloading v{u.latest_version}…
+          </div>
+          <div class="ts-update-progress">
+            <div
+              class="ts-update-progress-fill"
+              style="width:{pct}%;"
+            ></div>
+          </div>
+          <div class="ts-firstrun-sub ts-tnum">
+            {(updateState.downloaded / 1024 / 1024).toFixed(1)} /
+            {(updateState.total / 1024 / 1024).toFixed(1)} MB · {pct.toFixed(0)}%
+          </div>
+        {:else if updateState.kind === "downloaded"}
+          {@const u = updateState.info}
+          <div class="ts-firstrun-title" id="upd-title">
+            Downloaded v{u.latest_version}
+          </div>
+          <div class="ts-firstrun-sub">
+            Saved to <span class="ts-mono">{updateState.path}</span>. Open the DMG
+            to install — drag Tokenscope into Applications.
+          </div>
+          <div class="ts-update-actions">
+            <button class="ts-set-btn ts-btn-primary" onclick={openDownloadedDmg}
+              >Open DMG</button
+            >
+            <button class="ts-set-btn ts-btn-ghost" onclick={closeUpdateModal}
+              >Close</button
+            >
+          </div>
+        {:else if updateState.kind === "error"}
+          <div class="ts-firstrun-title" id="upd-title">Update check failed</div>
+          <div class="ts-firstrun-sub">{updateState.message}</div>
+          <div class="ts-update-actions">
+            <button class="ts-set-btn ts-btn-ghost" onclick={closeUpdateModal}
+              >Close</button
+            >
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
   {#if showFirstRun}
     <div class="ts-firstrun-scrim" role="presentation">
       <div
@@ -872,6 +1068,38 @@
               ~/.claude/ · local only, never uploaded
             </div>
           </div>
+        </div>
+
+        <div class="ts-set-divider"></div>
+
+        <div class="ts-set-about">
+          <div class="ts-set-about-row">
+            <div>
+              <div class="ts-set-about-name">Tokenscope</div>
+              <div class="ts-set-about-ver ts-mono ts-tnum">
+                v{info?.version ?? "?"}
+              </div>
+            </div>
+            <button
+              class="ts-set-btn"
+              onclick={checkForUpdates}
+              disabled={updateState.kind === "checking" ||
+                updateState.kind === "downloading"}
+            >
+              {updateState.kind === "checking"
+                ? "Checking…"
+                : "Check for updates"}
+            </button>
+          </div>
+          {#if info}
+            <div class="ts-set-about-links">
+              <a href={info.repo_url} target="_blank" rel="noreferrer">GitHub</a>
+              ·
+              <a href={info.release_url} target="_blank" rel="noreferrer">
+                Release notes
+              </a>
+            </div>
+          {/if}
         </div>
       </div>
     {/if}
@@ -1654,5 +1882,112 @@
     font-size: 11px;
     color: var(--ts-text-3);
     text-align: center;
+  }
+
+  /* update modal */
+  .ts-update-modal {
+    max-height: 80vh;
+    overflow-y: auto;
+  }
+  .ts-update-notes {
+    margin: 10px 0 0;
+    padding: 10px 12px;
+    background: var(--ts-surface-2);
+    border: 1px solid var(--ts-border);
+    border-radius: var(--ts-r-md);
+    font-size: 12px;
+    color: var(--ts-text-2);
+    white-space: pre-wrap;
+    line-height: 1.45;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .ts-update-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .ts-update-progress {
+    margin-top: 12px;
+    height: 6px;
+    background: var(--ts-surface);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .ts-update-progress-fill {
+    height: 100%;
+    background: var(--ts-accent);
+    transition: width 0.15s ease-out;
+  }
+
+  /* about section */
+  .ts-set-about-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+  }
+  .ts-set-about-name {
+    font-weight: 600;
+    color: var(--ts-text-1);
+  }
+  .ts-set-about-ver {
+    font-size: 11px;
+    color: var(--ts-text-3);
+    margin-top: 2px;
+  }
+  .ts-set-about-links {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--ts-text-3);
+  }
+  .ts-set-about-links a {
+    color: var(--ts-text-2);
+    text-decoration: none;
+  }
+  .ts-set-about-links a:hover {
+    color: var(--ts-accent);
+    text-decoration: underline;
+  }
+  .ts-set-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 26px;
+    padding: 0 12px;
+    border: 1px solid var(--ts-border-2);
+    border-radius: var(--ts-r-md);
+    background: var(--ts-surface-2);
+    color: var(--ts-text-1);
+    font-size: 12px;
+    cursor: pointer;
+    text-decoration: none;
+    user-select: none;
+  }
+  .ts-set-btn:hover:not(:disabled) {
+    background: var(--ts-surface);
+  }
+  .ts-set-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .ts-btn-primary {
+    background: var(--ts-accent);
+    border-color: var(--ts-accent);
+    color: white;
+  }
+  .ts-btn-primary:hover:not(:disabled) {
+    background: color-mix(in oklab, var(--ts-accent), white 10%);
+  }
+  .ts-btn-ghost {
+    background: transparent;
+    border-color: transparent;
+    color: var(--ts-text-2);
+  }
+  .ts-btn-ghost:hover:not(:disabled) {
+    background: var(--ts-surface);
+    color: var(--ts-text-1);
   }
 </style>

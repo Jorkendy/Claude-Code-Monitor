@@ -720,6 +720,199 @@ fn ensure_notification_permission(app: &AppHandle) {
     }
 }
 
+// ---- App info & updates ------------------------------------------------
+//
+// `check_update` polls the GitHub Releases API for the latest tag and
+// compares with the current binary version. `download_update` streams the
+// matching `.dmg` asset to ~/Downloads and emits progress events; on
+// completion the caller can ask `open_in_finder` to launch the DMG so the
+// user installs in the normal mac way. We deliberately don't auto-swap
+// the .app — that needs code signing + Sparkle, which the prerelease
+// distribution doesn't have.
+
+const REPO: &str = "Jorkendy/Claude-Code-Monitor";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Serialize)]
+struct AppInfo {
+    version: &'static str,
+    repo_url: String,
+    release_url: String,
+    latest_release_url: String,
+}
+
+#[tauri::command]
+fn app_info() -> AppInfo {
+    AppInfo {
+        version: APP_VERSION,
+        repo_url: format!("https://github.com/{REPO}"),
+        release_url: format!("https://github.com/{REPO}/releases/tag/v{APP_VERSION}"),
+        latest_release_url: format!("https://github.com/{REPO}/releases/latest"),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateInfo {
+    current_version: String,
+    latest_version: String,
+    has_update: bool,
+    release_notes: String,
+    release_url: String,
+    /// URL of the aarch64 `.dmg` asset, if any. Frontend disables Download
+    /// when this is None.
+    dmg_url: Option<String>,
+    dmg_size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct GhRelease {
+    tag_name: String,
+    html_url: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    assets: Vec<GhAsset>,
+}
+
+#[derive(Deserialize)]
+struct GhAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+}
+
+fn http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(format!("Tokenscope/{APP_VERSION}"))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+}
+
+/// Strip a leading `v` so `v0.1.2` compares equal to `0.1.2`.
+fn normalize_version(v: &str) -> &str {
+    v.strip_prefix('v').unwrap_or(v).trim()
+}
+
+#[tauri::command]
+async fn check_update() -> Result<UpdateInfo, String> {
+    let client = http_client().map_err(|e| e.to_string())?;
+    // Use /releases (plural) and pick the newest non-draft so we still find
+    // updates when the latest published release is marked prerelease — the
+    // `/releases/latest` endpoint hides prereleases entirely.
+    let resp = client
+        .get(format!("https://api.github.com/repos/{REPO}/releases?per_page=10"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub API returned {}", resp.status()));
+    }
+    let releases: Vec<GhRelease> = resp.json().await.map_err(|e| e.to_string())?;
+    let release = releases
+        .into_iter()
+        .find(|r| !r.tag_name.is_empty())
+        .ok_or_else(|| "no releases found".to_string())?;
+
+    let latest = normalize_version(&release.tag_name).to_string();
+    let current = APP_VERSION.to_string();
+    let has_update = latest != current;
+    let dmg = release
+        .assets
+        .iter()
+        .find(|a| a.name.ends_with("_aarch64.dmg") || a.name.ends_with(".dmg"));
+
+    Ok(UpdateInfo {
+        current_version: current,
+        latest_version: latest,
+        has_update,
+        release_notes: release.body,
+        release_url: release.html_url,
+        dmg_url: dmg.map(|a| a.browser_download_url.clone()),
+        dmg_size: dmg.map(|a| a.size),
+    })
+}
+
+#[derive(Clone, Serialize)]
+struct DownloadProgress {
+    downloaded: u64,
+    total: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DownloadResult {
+    path: String,
+}
+
+#[tauri::command]
+async fn download_update(
+    app: AppHandle,
+    url: String,
+) -> Result<DownloadResult, String> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+
+    let downloads = dirs::download_dir().ok_or("no Downloads dir")?;
+    let file_name = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Tokenscope_update.dmg");
+    let dest = downloads.join(file_name);
+
+    let client = http_client().map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    let total = resp.content_length().unwrap_or(0);
+
+    let mut file = std::fs::File::create(&dest).map_err(|e| e.to_string())?;
+    let mut downloaded: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    let mut last_emit = std::time::Instant::now();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        downloaded += bytes.len() as u64;
+        // Throttle event emission so we don't flood the IPC bridge on a
+        // fast download. ~10/sec is plenty for a smooth progress bar.
+        if last_emit.elapsed() >= std::time::Duration::from_millis(100) {
+            let _ = app.emit(
+                "update-progress",
+                DownloadProgress { downloaded, total },
+            );
+            last_emit = std::time::Instant::now();
+        }
+    }
+    let _ = app.emit(
+        "update-progress",
+        DownloadProgress {
+            downloaded,
+            total: total.max(downloaded),
+        },
+    );
+    file.flush().map_err(|e| e.to_string())?;
+
+    Ok(DownloadResult {
+        path: dest.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    // Plain `open` so the user gets the standard Finder "Verify → Install"
+    // flow for a DMG. Avoids needing the Tauri shell plugin permission.
+    std::process::Command::new("open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -809,6 +1002,10 @@ pub fn run() {
             delete_session_files,
             list_repo_rollups,
             open_dashboard,
+            app_info,
+            check_update,
+            download_update,
+            open_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

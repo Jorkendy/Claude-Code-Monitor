@@ -1,6 +1,6 @@
 [package]
 name = "tokenscope-app"
-version = "0.1.1"
+version = "0.1.2"
 description = "Tokenscope menubar app"
 edition = "2021"
 
@@ -18,3 +18,7 @@ notify = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokenscope = { path = "../.." }
+# rustls-tls so we don't pull in OpenSSL / system TLS.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+futures-util = "0.3"
+dirs = "5"
