@@ -18,15 +18,43 @@ use tauri_plugin_notification::{NotificationExt, PermissionState};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Settings {
     /// Notify when current 5h block cost exceeds this threshold (USD).
-    /// 0 disables the alert.
+    /// 0 disables the alert. Used only when plan == "api".
     budget_window_usd: f64,
+    /// "api" | "pro" | "max-5x" | "max-20x". API mode is per-token cost;
+    /// subscription modes track messages-vs-quota in the same 5h window.
+    #[serde(default = "default_plan")]
+    plan: String,
+    /// % of estimated 5h message quota that triggers a rate-limit warning.
+    /// Used only for subscription plans. 0 disables.
+    #[serde(default = "default_rate_warn")]
+    rate_limit_warn_pct: f64,
+}
+
+fn default_plan() -> String {
+    "api".to_string()
+}
+fn default_rate_warn() -> f64 {
+    90.0
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             budget_window_usd: 5.0,
+            plan: default_plan(),
+            rate_limit_warn_pct: default_rate_warn(),
         }
+    }
+}
+
+/// Community-estimated message quota per 5h window for each plan.
+/// Returns None for "api" (no quota; cost-based).
+fn quota_for(plan: &str) -> Option<u64> {
+    match plan {
+        "pro" => Some(45),
+        "max-5x" => Some(225),
+        "max-20x" => Some(900),
+        _ => None,
     }
 }
 
@@ -383,8 +411,37 @@ fn open_dashboard(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn active_burn() -> Option<api::ActiveBurn> {
-    api::list_blocks_enriched(None).ok()?.active
+#[derive(Default)]
+struct ActiveSnapshot {
+    cost: f64,
+    rate: f64,
+    projected: f64,
+    block_start_ms: i64,
+    message_count: u64,
+}
+
+// Single read of the enriched blocks: avoids two separate scans when both
+// tray formatting and alerting want the active-block fields.
+fn active_snapshot() -> ActiveSnapshot {
+    let Ok(enriched) = api::list_blocks_enriched(None) else {
+        return ActiveSnapshot::default();
+    };
+    let active_msgs = enriched
+        .blocks
+        .iter()
+        .find(|b| b.is_active)
+        .map(|b| b.message_count as u64)
+        .unwrap_or(0);
+    let Some(burn) = enriched.active else {
+        return ActiveSnapshot::default();
+    };
+    ActiveSnapshot {
+        cost: burn.current_usd,
+        rate: burn.burn_usd_per_hr,
+        projected: burn.projected_block_usd,
+        block_start_ms: burn.block_start_ms,
+        message_count: active_msgs,
+    }
 }
 
 struct TrayState {
@@ -393,21 +450,28 @@ struct TrayState {
 }
 
 // Minimal + alert breakthrough per design spec:
-//   `$cost · $burn/hr` (burn hidden when < 0.5/hr → just `$cost`)
+//   API mode:          `$cost · $burn/hr` (burn hidden when < 0.5/hr)
+//   Subscription mode: `N msgs · NN%`
 //   Prepend `⚠` when:
-//     critical: any active/idle session at ≥ 90% context
-//     warning:  budget > 0 and projected ≥ budget
+//     critical: any active/idle session at ≥ 90% context (both modes)
+//     warning:  budget threshold (API) or rate-limit % (subscription)
 //   Critical wins over warning. Tooltip names the cause.
 fn tray_state(app: &AppHandle) -> TrayState {
-    let burn = active_burn();
-    let cost = burn.as_ref().map(|a| a.current_usd).unwrap_or(0.0);
-    let rate = burn.as_ref().map(|a| a.burn_usd_per_hr).unwrap_or(0.0);
-    let projected = burn.as_ref().map(|a| a.projected_block_usd).unwrap_or(0.0);
+    let snap = active_snapshot();
+    let settings = load_settings(app);
+    let quota = quota_for(&settings.plan);
 
-    let base = if rate >= 0.5 {
-        format!("${cost:.2} · ${rate:.2}/hr")
+    let base = if let Some(q) = quota {
+        let pct = if q > 0 {
+            (snap.message_count as f64 / q as f64 * 100.0).round() as i64
+        } else {
+            0
+        };
+        format!("{} msgs · {}%", snap.message_count, pct)
+    } else if snap.rate >= 0.5 {
+        format!("${:.2} · ${:.2}/hr", snap.cost, snap.rate)
     } else {
-        format!("${cost:.2}")
+        format!("${:.2}", snap.cost)
     };
 
     // Critical: any live session ≥ 90% context.
@@ -445,13 +509,26 @@ fn tray_state(app: &AppHandle) -> TrayState {
         }
     }
 
-    let settings = load_settings(app);
-    if settings.budget_window_usd > 0.0 && projected >= settings.budget_window_usd {
+    // Warning: plan-specific budget vs projected (API) or rate-limit % (subs).
+    if let Some(q) = quota {
+        if settings.rate_limit_warn_pct > 0.0 && q > 0 {
+            let pct = snap.message_count as f64 / q as f64 * 100.0;
+            if pct >= settings.rate_limit_warn_pct {
+                return TrayState {
+                    title: format!("⚠ {base}"),
+                    tooltip: Some(format!(
+                        "{:.0}% of estimated {q}-msg quota used",
+                        pct
+                    )),
+                };
+            }
+        }
+    } else if settings.budget_window_usd > 0.0 && snap.projected >= settings.budget_window_usd {
         return TrayState {
             title: format!("⚠ {base}"),
             tooltip: Some(format!(
-                "projected ${projected:.2} ≥ ${:.2} budget",
-                settings.budget_window_usd
+                "projected ${:.2} ≥ ${:.2} budget",
+                snap.projected, settings.budget_window_usd
             )),
         };
     }
@@ -480,48 +557,84 @@ static PROJ_ALERTED_BLOCK_START: Mutex<Option<i64>> = Mutex::new(None);
 
 fn check_budget(app: &AppHandle) {
     let settings = load_settings(app);
-    if settings.budget_window_usd <= 0.0 {
-        eprintln!("[budget] disabled (threshold=0)");
+    let snap = active_snapshot();
+    if snap.block_start_ms == 0 {
+        eprintln!("[alert] no active block");
         return;
     }
-    let Some(burn) = active_burn() else {
-        eprintln!("[budget] no active block");
-        return;
-    };
-    let cost = burn.current_usd;
-    let projected = burn.projected_block_usd;
-    eprintln!(
-        "[budget] cost=${cost:.2} proj=${projected:.2} threshold=${:.2}",
-        settings.budget_window_usd
-    );
-    // Re-arm projection alert when block boundary changes.
+
+    // Re-arm fire-once-per-block latches when the 5h window rolls over.
     {
         let mut last_block = PROJ_ALERTED_BLOCK_START.lock().unwrap();
-        if *last_block != Some(burn.block_start_ms) {
+        if *last_block != Some(snap.block_start_ms) {
             *last_block = None;
         }
     }
+
+    if let Some(q) = quota_for(&settings.plan) {
+        // Subscription plan: rate-limit warning at % of estimated quota.
+        if settings.rate_limit_warn_pct <= 0.0 || q == 0 {
+            eprintln!("[alert] rate-limit disabled (threshold=0)");
+            return;
+        }
+        let pct = snap.message_count as f64 / q as f64 * 100.0;
+        eprintln!(
+            "[alert] subs plan={} msgs={}/{q} ({:.0}%) threshold={:.0}%",
+            settings.plan, snap.message_count, pct, settings.rate_limit_warn_pct
+        );
+        let mut fired = ALERT_FIRED_FOR_CURRENT_CROSSING.lock().unwrap();
+        if pct < settings.rate_limit_warn_pct {
+            *fired = false;
+            return;
+        }
+        if !*fired {
+            let res = app
+                .notification()
+                .builder()
+                .title("Tokenscope — approaching rate limit")
+                .body(format!(
+                    "{} of ~{q} messages used in this 5h window ({:.0}%)",
+                    snap.message_count, pct
+                ))
+                .show();
+            eprintln!("[alert] rate-limit notification => {res:?}");
+            *fired = true;
+        }
+        return;
+    }
+
+    // API plan: budget threshold.
+    if settings.budget_window_usd <= 0.0 {
+        eprintln!("[alert] budget disabled (threshold=0)");
+        return;
+    }
+    eprintln!(
+        "[alert] api cost=${:.2} proj=${:.2} threshold=${:.2}",
+        snap.cost, snap.projected, settings.budget_window_usd
+    );
     // Proactive: projected to cross but actual hasn't yet → tell user once
     // per block, so they can pause before they're surprised.
-    if projected >= settings.budget_window_usd && cost < settings.budget_window_usd {
+    if snap.projected >= settings.budget_window_usd
+        && snap.cost < settings.budget_window_usd
+    {
         let mut last_block = PROJ_ALERTED_BLOCK_START.lock().unwrap();
-        if *last_block != Some(burn.block_start_ms) {
+        if *last_block != Some(snap.block_start_ms) {
             let res = app
                 .notification()
                 .builder()
                 .title("Tokenscope — projected over budget")
                 .body(format!(
-                    "Block trending to ${projected:.2} by reset (threshold ${:.2}, burn ${:.0}/hr)",
-                    settings.budget_window_usd, burn.burn_usd_per_hr
+                    "Block trending to ${:.2} by reset (threshold ${:.2}, burn ${:.0}/hr)",
+                    snap.projected, settings.budget_window_usd, snap.rate
                 ))
                 .show();
-            eprintln!("[budget] projection notification => {res:?}");
-            *last_block = Some(burn.block_start_ms);
+            eprintln!("[alert] projection notification => {res:?}");
+            *last_block = Some(snap.block_start_ms);
         }
     }
     let mut fired = ALERT_FIRED_FOR_CURRENT_CROSSING.lock().unwrap();
     let mut last = LAST_ALERT.lock().unwrap();
-    if cost < settings.budget_window_usd {
+    if snap.cost < settings.budget_window_usd {
         *fired = false;
         return;
     }
@@ -532,11 +645,11 @@ fn check_budget(app: &AppHandle) {
             .builder()
             .title("Tokenscope")
             .body(format!(
-                "Current 5h block at ${cost:.2} (threshold ${:.2})",
-                settings.budget_window_usd
+                "Current 5h block at ${:.2} (threshold ${:.2})",
+                snap.cost, settings.budget_window_usd
             ))
             .show();
-        eprintln!("[budget] notification show => {res:?}");
+        eprintln!("[alert] notification show => {res:?}");
         *fired = true;
         *last = Some(Instant::now());
     }

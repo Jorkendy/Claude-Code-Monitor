@@ -20,9 +20,10 @@ use crate::model::Tokens;
 use crate::parser::{self, JsonlSummary};
 
 // Schema-versioned filename: bumping invalidates old caches without an
-// explicit migration step. v1 lacked `latest_name`, which left inactive
-// sessions nameless because size+mtime always match for closed transcripts.
-const CACHE_FILE: &str = ".tokenscope-cache-v2.json";
+// explicit migration step. v1 lacked `latest_name`. v2 cached pre-compact
+// context for sessions that had run `/compact` before the parser learned
+// to honor `isCompactSummary`; bump to v3 to re-scan them.
+const CACHE_FILE: &str = ".tokenscope-cache-v3.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {

@@ -16,6 +16,7 @@
   import Icon from "$lib/components/Icon.svelte";
   import StatusDot from "$lib/components/StatusDot.svelte";
   import ContextBar from "$lib/components/ContextBar.svelte";
+  import CopyButton from "$lib/components/CopyButton.svelte";
 
   type Session = {
     session_id: string;
@@ -44,6 +45,18 @@
 
   type View = "sessions" | "repos";
   type StatusFilter = "all" | "active" | "idle" | "inactive";
+  type Plan = "api" | "pro" | "max-5x" | "max-20x";
+  type Settings = {
+    budget_window_usd: number;
+    plan: Plan;
+    rate_limit_warn_pct: number;
+  };
+  const QUOTA: Record<Plan, number | null> = {
+    api: null,
+    pro: 45,
+    "max-5x": 225,
+    "max-20x": 900,
+  };
   type SessionSortKey =
     | "name"
     | "repo"
@@ -61,9 +74,15 @@
   let sessions: Session[] = $state([]);
   let repos: Repo[] = $state([]);
   let hidden: Set<string> = $state(new Set());
+  let settings: Settings = $state({
+    budget_window_usd: 0,
+    plan: "api",
+    rate_limit_warn_pct: 90,
+  });
   let loading = $state(true);
   let error: string | null = $state(null);
   let now = $state(Date.now());
+  const isSubs = $derived(QUOTA[settings.plan] != null);
 
   // sessions toolbar/sort state
   let search = $state("");
@@ -83,14 +102,16 @@
     try {
       if (showSpinner) loading = true;
       error = null;
-      const [s, r, h] = await Promise.all([
+      const [s, r, h, st] = await Promise.all([
         invoke<Session[]>("list_sessions"),
         invoke<Repo[]>("list_repo_rollups"),
         invoke<string[]>("list_hidden"),
+        invoke<Settings>("get_settings"),
       ]);
       sessions = s;
       repos = r;
       hidden = new Set(h);
+      settings = st;
     } catch (e) {
       error = String(e);
     } finally {
@@ -228,7 +249,11 @@
   const maxRepoCost = $derived(
     Math.max(...repos.map((r) => r.total_cost_usd), 0.0001),
   );
+  const maxRepoTokens = $derived(
+    Math.max(...repos.map((r) => r.total_tokens), 1),
+  );
   const grandCost = $derived(repos.reduce((s, r) => s + r.total_cost_usd, 0));
+  const grandTokens = $derived(repos.reduce((s, r) => s + r.total_tokens, 0));
 
   function onSortRepos(k: RepoSortKey) {
     if (k === repoSortKey) repoSortDir = repoSortDir === "asc" ? "desc" : "asc";
@@ -256,18 +281,20 @@
     { k: "actions", label: "", align: "right", sort: false },
   ];
 
-  const repoCols: Array<{
-    k: RepoSortKey;
-    label: string;
-    align: "left" | "right";
-  }> = [
+  const repoCols = $derived<
+    Array<{ k: RepoSortKey; label: string; align: "left" | "right" }>
+  >([
     { k: "repo", label: "Repository", align: "left" },
     { k: "session_count", label: "Sessions", align: "right" },
     { k: "live_count", label: "Live", align: "right" },
     { k: "total_tokens", label: "Tokens", align: "right" },
-    { k: "total_cost_usd", label: "Total cost", align: "right" },
+    {
+      k: "total_cost_usd",
+      label: isSubs ? "Volume" : "Total cost",
+      align: "right",
+    },
     { k: "top_model", label: "Top model", align: "left" },
-  ];
+  ]);
 </script>
 
 <div class="dash-win">
@@ -423,6 +450,15 @@
                       <span class={s.name ? "" : "ts-mono ts-text2"}>
                         {s.name ?? s.session_id.slice(0, 8)}
                       </span>
+                      {#if !s.name}
+                        <span
+                          class="ts-sess-copy"
+                          onclick={(e) => e.stopPropagation()}
+                          role="presentation"
+                        >
+                          <CopyButton text={s.session_id} title="Copy UID" />
+                        </span>
+                      {/if}
                     </div>
                     <div class="ts-td ts-mono ts-text2">{repoName(s.cwd)}</div>
                     <div class="ts-td">
@@ -435,10 +471,18 @@
                         style="color:var(--ts-tier-{tier});">{pct}%</span
                       >
                     </div>
-                    <div class="ts-td ts-al-right ts-tnum ts-text2">
+                    <div
+                      class="ts-td ts-al-right ts-tnum"
+                      class:ts-cost-strong={isSubs}
+                      class:ts-text2={!isSubs}
+                    >
                       {fmtTokensShort(totalTokens(s.tokens))}
                     </div>
-                    <div class="ts-td ts-al-right ts-tnum ts-cost-strong">
+                    <div
+                      class="ts-td ts-al-right ts-tnum"
+                      class:ts-cost-strong={!isSubs}
+                      class:ts-text3={isSubs}
+                    >
                       {fmtUSD(s.cost_usd)}
                     </div>
                     <div class="ts-td ts-al-right ts-tnum ts-text3">
@@ -502,11 +546,30 @@
                         </div>
                         <div class="ts-rd-meta">
                           <div class="ts-drow"><span class="ts-drow-k">Context</span><span class="ts-drow-v ts-tnum" style="color:var(--ts-tier-{tier});">{fmtTokensFull(s.context_tokens)} / {fmtTokensShort(s.context_limit)} · {pct}%</span></div>
+                          <div class="ts-drow">
+                            <span class="ts-drow-k">Model</span>
+                            <span class="ts-drow-v-wrap">
+                              <span class="ts-drow-v ts-mono">{s.model ?? "—"}</span>
+                              {#if s.model}<CopyButton text={s.model} title="Copy model" />{/if}
+                            </span>
+                          </div>
                           <div class="ts-drow"><span class="ts-drow-k">Cost</span><span class="ts-drow-v ts-tnum">{fmtUSD(s.cost_usd)}</span></div>
                           <div class="ts-drow"><span class="ts-drow-k">Updated</span><span class="ts-drow-v ts-tnum">{fmtRelTime(s.updated_at_ms, now)}</span></div>
                           <div class="ts-drow"><span class="ts-drow-k">PID</span><span class="ts-drow-v ts-mono ts-tnum">{s.pid ?? "— not running"}</span></div>
-                          <div class="ts-drow"><span class="ts-drow-k">Path</span><span class="ts-drow-v ts-mono is-ellipsis" title={s.cwd ?? ""}>{s.cwd ?? "—"}</span></div>
-                          <div class="ts-drow"><span class="ts-drow-k">UID</span><span class="ts-drow-v ts-mono is-ellipsis" title={s.session_id}>{s.session_id}</span></div>
+                          <div class="ts-drow">
+                            <span class="ts-drow-k">Path</span>
+                            <span class="ts-drow-v-wrap">
+                              <span class="ts-drow-v ts-mono is-ellipsis" title={s.cwd ?? ""}>{s.cwd ?? "—"}</span>
+                              {#if s.cwd}<CopyButton text={s.cwd} title="Copy path" />{/if}
+                            </span>
+                          </div>
+                          <div class="ts-drow">
+                            <span class="ts-drow-k">UID</span>
+                            <span class="ts-drow-v-wrap">
+                              <span class="ts-drow-v ts-mono is-ellipsis" title={s.session_id}>{s.session_id}</span>
+                              <CopyButton text={s.session_id} title="Copy UID" />
+                            </span>
+                          </div>
                         </div>
                       </div>
                     </div>
@@ -519,7 +582,12 @@
           <div class="ts-dash-h1row">
             <h1 class="ts-dash-h1">Repositories</h1>
             <span class="ts-dash-sub ts-tnum">
-              {repos.length} repos · {fmtUSD(grandCost)} total this week
+              {#if isSubs}
+                {repos.length} repos · {fmtTokensShort(grandTokens)} tokens
+                · <span class="ts-text3">~{fmtUSD(grandCost)} equiv</span>
+              {:else}
+                {repos.length} repos · {fmtUSD(grandCost)} total this week
+              {/if}
             </span>
           </div>
 
@@ -558,19 +626,38 @@
                       <span class="ts-text3">0</span>
                     {/if}
                   </div>
-                  <div class="ts-td ts-al-right ts-tnum ts-text2">
+                  <div
+                    class="ts-td ts-al-right ts-tnum"
+                    class:ts-text2={!isSubs}
+                    class:ts-cost-strong={isSubs}
+                  >
                     {fmtTokensShort(r.total_tokens)}
                   </div>
                   <div class="ts-td ts-al-right ts-cost-cell">
-                    <div class="ts-cost-bar">
-                      <div
-                        class="ts-cost-fill"
-                        style="width:{(r.total_cost_usd / maxRepoCost) * 100}%;"
-                      ></div>
-                    </div>
-                    <span class="ts-tnum ts-cost-val">
-                      {fmtUSD(r.total_cost_usd)}
-                    </span>
+                    {#if isSubs}
+                      <div class="ts-cost-bar">
+                        <div
+                          class="ts-cost-fill"
+                          style="width:{(r.total_tokens / maxRepoTokens) * 100}%;"
+                        ></div>
+                      </div>
+                      <span class="ts-tnum ts-cost-val-subs">
+                        {fmtTokensShort(r.total_tokens)}
+                        <span class="ts-cost-shadow ts-tnum"
+                          >~{fmtUSD(r.total_cost_usd)}</span
+                        >
+                      </span>
+                    {:else}
+                      <div class="ts-cost-bar">
+                        <div
+                          class="ts-cost-fill"
+                          style="width:{(r.total_cost_usd / maxRepoCost) * 100}%;"
+                        ></div>
+                      </div>
+                      <span class="ts-tnum ts-cost-val">
+                        {fmtUSD(r.total_cost_usd)}
+                      </span>
+                    {/if}
                   </div>
                   <div class="ts-td">
                     {#if r.top_model}
@@ -1002,6 +1089,21 @@
     min-width: 52px;
     text-align: right;
   }
+  .ts-cost-val-subs {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 1px;
+    min-width: 70px;
+  }
+  .ts-cost-val-subs {
+    font-weight: 600;
+  }
+  .ts-cost-shadow {
+    font-size: 10.5px;
+    color: var(--ts-text-3);
+    font-weight: 500;
+  }
 
   /* sessions table grid */
   .ts-sess-grid {
@@ -1040,6 +1142,15 @@
     color: var(--ts-text-3);
     flex-shrink: 0;
     display: inline-flex;
+  }
+  .ts-sess-copy {
+    display: inline-flex;
+    opacity: 0;
+    transition: opacity 0.12s;
+  }
+  .ts-rowwrap:hover .ts-sess-copy,
+  .ts-rowwrap.is-open .ts-sess-copy {
+    opacity: 1;
   }
   .ts-ctx-cell {
     display: flex;
@@ -1157,6 +1268,12 @@
     text-overflow: ellipsis;
     max-width: 230px;
     direction: rtl;
+  }
+  .ts-drow-v-wrap {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    flex: 0 1 auto;
   }
   .ts-empty {
     padding: 40px;

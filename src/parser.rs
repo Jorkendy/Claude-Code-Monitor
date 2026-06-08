@@ -39,6 +39,10 @@ pub struct JsonlSummary {
 
 const NEEDLE_USAGE: &[u8] = b"\"usage\"";
 const NEEDLE_TITLE: &[u8] = b"\"customTitle\"";
+const NEEDLE_COMPACT: &[u8] = b"\"isCompactSummary\"";
+/// Rough constant added to the estimated post-compact context, accounting for
+/// system prompt + tool list that the next turn re-sends alongside the summary.
+const COMPACT_OVERHEAD_TOKENS: u64 = 5_000;
 
 pub fn sum_jsonl(path: &Path, resume_from_offset: u64) -> Result<JsonlSummary> {
     let mut file = File::open(path)?;
@@ -77,7 +81,8 @@ pub fn sum_jsonl(path: &Path, resume_from_offset: u64) -> Result<JsonlSummary> {
         summary.byte_offset += n as u64;
         let has_usage = contains_subslice(&buf, NEEDLE_USAGE);
         let has_title = !has_usage && contains_subslice(&buf, NEEDLE_TITLE);
-        if !has_usage && !has_title {
+        let has_compact = !has_usage && !has_title && contains_subslice(&buf, NEEDLE_COMPACT);
+        if !has_usage && !has_title && !has_compact {
             continue;
         }
         let Ok(value): serde_json::Result<serde_json::Value> = serde_json::from_slice(&buf) else {
@@ -86,6 +91,31 @@ pub fn sum_jsonl(path: &Path, resume_from_offset: u64) -> Result<JsonlSummary> {
         if has_title {
             if let Some(t) = value.get("customTitle").and_then(|v| v.as_str()) {
                 summary.latest_name = Some(t.to_string());
+            }
+            continue;
+        }
+        if has_compact {
+            // /compact writes a synthetic user message carrying the new
+            // context. No real model turn runs until the user types again, so
+            // without this branch the UI would keep showing the pre-compact
+            // (~97%) value forever. Estimate the post-compact context from
+            // the summary text length + system/tools overhead.
+            if value.get("isCompactSummary").and_then(|v| v.as_bool()) != Some(true) {
+                continue;
+            }
+            let Some(ts_str) = value.get("timestamp").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            let Ok(ts) = chrono::DateTime::parse_from_rfc3339(ts_str) else {
+                continue;
+            };
+            let ts_ms = ts.timestamp_millis();
+            let content_bytes = summary_content_bytes(&value);
+            // Anthropic's "1 token ≈ 4 chars" rule of thumb for English.
+            let estimated = (content_bytes as u64 / 4).saturating_add(COMPACT_OVERHEAD_TOKENS);
+            if ts_ms >= summary.latest_ts_ms {
+                summary.latest_ts_ms = ts_ms;
+                summary.latest_context_tokens = estimated;
             }
             continue;
         }
@@ -190,6 +220,25 @@ pub fn events_jsonl(path: &Path, since_ms: i64) -> anyhow::Result<Vec<UsageEvent
 
 fn as_u64(v: Option<&serde_json::Value>) -> u64 {
     v.and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+// `/compact` summary content can be either a plain string or an array of
+// content blocks (`[{type:"text", text:"..."}, ...]`). Sum byte length.
+fn summary_content_bytes(value: &serde_json::Value) -> usize {
+    let Some(content) = value.pointer("/message/content") else {
+        return 0;
+    };
+    if let Some(s) = content.as_str() {
+        return s.len();
+    }
+    if let Some(arr) = content.as_array() {
+        return arr
+            .iter()
+            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+            .map(|s| s.len())
+            .sum();
+    }
+    0
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {

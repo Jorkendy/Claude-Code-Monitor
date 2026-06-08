@@ -20,6 +20,7 @@
   import StatusDot from "$lib/components/StatusDot.svelte";
   import ContextBar from "$lib/components/ContextBar.svelte";
   import Sparkline from "$lib/components/Sparkline.svelte";
+  import CopyButton from "$lib/components/CopyButton.svelte";
 
   type Session = {
     session_id: string;
@@ -51,13 +52,36 @@
     projected_block_usd: number;
   };
 
-  type Settings = { budget_window_usd: number };
+  type Plan = "api" | "pro" | "max-5x" | "max-20x";
+  type Settings = {
+    budget_window_usd: number;
+    plan: Plan;
+    rate_limit_warn_pct: number;
+  };
   type Tab = "sessions" | "blocks" | "settings";
+
+  // Community-estimated message quota per 5h window — mirrors backend.
+  const QUOTA: Record<Plan, number | null> = {
+    api: null,
+    pro: 45,
+    "max-5x": 225,
+    "max-20x": 900,
+  };
+  const PLAN_LABEL: Record<Plan, string> = {
+    api: "API",
+    pro: "Pro",
+    "max-5x": "Max 5×",
+    "max-20x": "Max 20×",
+  };
 
   let tab: Tab = $state("sessions");
   let sessions: Session[] = $state([]);
   let blocks: BlockView[] = $state([]);
-  let settings: Settings = $state({ budget_window_usd: 0 });
+  let settings: Settings = $state({
+    budget_window_usd: 0,
+    plan: "api",
+    rate_limit_warn_pct: 90,
+  });
   let loading = $state(true);
   let error: string | null = $state(null);
   let now = $state(Date.now());
@@ -161,49 +185,106 @@
   // Hero derivations.
   const heroBlock = $derived(activeBlock);
   const heroBurnSeries = $derived(synthBurnSeries(heroBlock?.burn_usd_per_hr ?? 0));
-  const heroProgress = $derived.by(() => {
+  const heroTimeProgress = $derived.by(() => {
     if (!heroBlock) return 0;
     const elapsed = now - heroBlock.start_ms;
     const total = heroBlock.end_ms - heroBlock.start_ms;
     return Math.min(100, Math.max(0, (elapsed / total) * 100));
   });
   const heroRemaining = $derived(heroBlock ? heroBlock.end_ms - now : 0);
+
+  // Subscription-mode derivations.
+  const quota = $derived(QUOTA[settings.plan]);
+  const isSubs = $derived(quota != null);
+  const quotaPct = $derived.by(() => {
+    if (!heroBlock || quota == null || quota === 0) return 0;
+    return Math.min(999, (heroBlock.message_count / quota) * 100);
+  });
+  const quotaTier = $derived(contextTier(quotaPct));
+  // Linear extrapolation across the 5h window. Block.message_count grows
+  // monotonically; if we've used N msgs in T elapsed minutes of a 5h window,
+  // straight-line projects to N * 300/T by reset.
+  const projectedMsgs = $derived.by(() => {
+    if (!heroBlock) return 0;
+    const elapsed = now - heroBlock.start_ms;
+    if (elapsed < 60_000) return heroBlock.message_count;
+    const total = heroBlock.end_ms - heroBlock.start_ms;
+    return Math.round((heroBlock.message_count * total) / elapsed);
+  });
+  const msgPerHr = $derived.by(() => {
+    if (!heroBlock) return 0;
+    const elapsedHr = Math.max(1 / 60, (now - heroBlock.start_ms) / 3_600_000);
+    return heroBlock.message_count / elapsedHr;
+  });
+  // Drives the bottom progress bar. Time elapsed in API mode (so user sees
+  // window emptying); quota % in subscription mode (the real concern).
+  const heroBarPct = $derived(isSubs ? Math.min(100, quotaPct) : heroTimeProgress);
+  const heroBarColor = $derived(
+    isSubs ? `var(--ts-tier-${quotaTier})` : "var(--ts-accent)",
+  );
 </script>
 
 <div class="ts-popover" data-popover-root>
   {#if heroBlock}
     {@const burnHot = heroBlock.burn_usd_per_hr >= 0.5}
+    {@const rateHot = isSubs ? quotaPct >= 50 : burnHot}
     <div class="ts-hero">
       <div class="ts-hero-top">
         <div class="ts-hero-block">
-          <div class="ts-hero-label">CURRENT BLOCK</div>
-          <div class="ts-hero-cost ts-tnum">{fmtUSD(heroBlock.cost_usd)}</div>
-          <div class="ts-hero-proj ts-tnum">
-            est. {fmtUSD(heroBlock.projected_block_usd)}
-          </div>
+          {#if isSubs}
+            <div class="ts-hero-label">5H WINDOW MESSAGES</div>
+            <div class="ts-hero-cost ts-tnum">
+              {heroBlock.message_count}<span class="ts-hero-quota-sep"
+                >/{quota}</span
+              >
+            </div>
+            <div class="ts-hero-proj ts-tnum">
+              <span style="color:var(--ts-tier-{quotaTier});"
+                >{quotaPct.toFixed(0)}%</span
+              >
+              · est. {projectedMsgs} by reset
+            </div>
+          {:else}
+            <div class="ts-hero-label">CURRENT BLOCK</div>
+            <div class="ts-hero-cost ts-tnum">{fmtUSD(heroBlock.cost_usd)}</div>
+            <div class="ts-hero-proj ts-tnum">
+              est. {fmtUSD(heroBlock.projected_block_usd)}
+            </div>
+          {/if}
         </div>
         <div class="ts-hero-burn">
-          <div class="ts-hero-label ts-hero-label-r">BURN RATE</div>
+          <div class="ts-hero-label ts-hero-label-r">
+            {isSubs ? "PACE" : "BURN RATE"}
+          </div>
           <div class="ts-hero-sparkrow">
             <Sparkline
               data={heroBurnSeries}
               width={120}
               height={30}
-              stroke={burnHot ? "var(--ts-accent)" : "var(--ts-text-3)"}
+              stroke={rateHot ? "var(--ts-accent)" : "var(--ts-text-3)"}
             />
           </div>
           <div
             class="ts-hero-burnval-sm ts-tnum"
-            style="color:{burnHot ? 'var(--ts-burn-hot)' : 'var(--ts-text-2)'};"
+            style="color:{rateHot ? 'var(--ts-burn-hot)' : 'var(--ts-text-2)'};"
           >
-            {fmtUSD(heroBlock.burn_usd_per_hr)}<span class="ts-hero-unit">/hr</span>
+            {#if isSubs}
+              {msgPerHr.toFixed(0)}<span class="ts-hero-unit">msg/hr</span>
+            {:else}
+              {fmtUSD(heroBlock.burn_usd_per_hr)}<span class="ts-hero-unit"
+                >/hr</span
+              >
+            {/if}
           </div>
         </div>
       </div>
 
       <div class="ts-hero-reset">
         <div class="ts-hero-resetbar">
-          <div class="ts-hero-resetfill" style="width:{heroProgress}%;"></div>
+          <div
+            class="ts-hero-resetfill"
+            style="width:{heroBarPct}%;background:{heroBarColor};"
+          ></div>
         </div>
         <div class="ts-hero-resetmeta">
           <span>{liveSessions.length} live</span>
@@ -213,7 +294,9 @@
     </div>
   {:else}
     <div class="ts-hero ts-hero-empty">
-      <div class="ts-hero-label">CURRENT BLOCK</div>
+      <div class="ts-hero-label">
+        {isSubs ? "5H WINDOW MESSAGES" : "CURRENT BLOCK"}
+      </div>
       <div class="ts-hero-cost ts-tnum">—</div>
       <div class="ts-hero-proj">No active block.</div>
     </div>
@@ -272,7 +355,15 @@
                     >{displayName(s)}</span
                   >
                 </div>
-                <div class="ts-card-cost ts-tnum">{fmtUSD(s.cost_usd)}</div>
+                {#if isSubs}
+                  <div class="ts-card-cost ts-tnum">
+                    {fmtTokensShort(totalTokens(s.tokens))}<span
+                      class="ts-card-unit">tok</span
+                    >
+                  </div>
+                {:else}
+                  <div class="ts-card-cost ts-tnum">{fmtUSD(s.cost_usd)}</div>
+                {/if}
               </div>
 
               <div class="ts-card-ctx">
@@ -318,12 +409,30 @@
                   </div>
                   <div class="ts-detail-rows">
                     <div class="ts-drow"><span class="ts-drow-k">Context</span><span class="ts-drow-v ts-tnum" style="color:var(--ts-tier-{tier});">{fmtTokensFull(s.context_tokens)} / {fmtTokensShort(s.context_limit)}</span></div>
-                    <div class="ts-drow"><span class="ts-drow-k">Model</span><span class="ts-drow-v ts-mono">{s.model ?? "—"}</span></div>
+                    <div class="ts-drow">
+                      <span class="ts-drow-k">Model</span>
+                      <span class="ts-drow-v-wrap">
+                        <span class="ts-drow-v ts-mono">{s.model ?? "—"}</span>
+                        {#if s.model}<CopyButton text={s.model} title="Copy model" />{/if}
+                      </span>
+                    </div>
                     <div class="ts-drow"><span class="ts-drow-k">Cost</span><span class="ts-drow-v ts-tnum">{fmtUSD(s.cost_usd)}</span></div>
                     <div class="ts-drow"><span class="ts-drow-k">Updated</span><span class="ts-drow-v ts-tnum">{fmtRelTime(s.updated_at_ms, now)}</span></div>
-                    <div class="ts-drow"><span class="ts-drow-k">Path</span><span class="ts-drow-v ts-mono is-ellipsis" title={s.cwd ?? ""}>{s.cwd ?? "—"}</span></div>
+                    <div class="ts-drow">
+                      <span class="ts-drow-k">Path</span>
+                      <span class="ts-drow-v-wrap">
+                        <span class="ts-drow-v ts-mono is-ellipsis" title={s.cwd ?? ""}>{s.cwd ?? "—"}</span>
+                        {#if s.cwd}<CopyButton text={s.cwd} title="Copy path" />{/if}
+                      </span>
+                    </div>
                     <div class="ts-drow"><span class="ts-drow-k">PID</span><span class="ts-drow-v ts-mono ts-tnum">{s.pid ?? "—"}</span></div>
-                    <div class="ts-drow"><span class="ts-drow-k">UID</span><span class="ts-drow-v ts-mono is-ellipsis" title={s.session_id}>{s.session_id}</span></div>
+                    <div class="ts-drow">
+                      <span class="ts-drow-k">UID</span>
+                      <span class="ts-drow-v-wrap">
+                        <span class="ts-drow-v ts-mono is-ellipsis" title={s.session_id}>{s.session_id}</span>
+                        <CopyButton text={s.session_id} title="Copy UID" />
+                      </span>
+                    </div>
                   </div>
                 </div>
               {/if}
@@ -343,8 +452,12 @@
           {@const burnHot = activeBlock.burn_usd_per_hr >= 0.5}
           {@const elapsed = now - activeBlock.start_ms}
           {@const total = activeBlock.end_ms - activeBlock.start_ms}
-          {@const progress = Math.min(100, Math.max(0, (elapsed / total) * 100))}
+          {@const timePct = Math.min(100, Math.max(0, (elapsed / total) * 100))}
           {@const remaining = activeBlock.end_ms - now}
+          {@const barPct = isSubs ? Math.min(100, quotaPct) : timePct}
+          {@const barColor = isSubs
+            ? `var(--ts-tier-${quotaTier})`
+            : "var(--ts-accent)"}
           <div class="ts-activeblock">
             <div class="ts-ab-head">
               <span class="ts-ab-live"
@@ -354,25 +467,55 @@
                 >{fmtClock(activeBlock.start_ms)} – {fmtClock(activeBlock.end_ms)}</span
               >
             </div>
-            <div class="ts-ab-costrow">
-              <div class="ts-ab-cost ts-tnum">{fmtUSD(activeBlock.cost_usd)}</div>
-              <div class="ts-ab-proj">
-                <div class="ts-ab-projval ts-tnum">
-                  {fmtUSD(activeBlock.projected_block_usd)}
+            {#if isSubs}
+              <div class="ts-ab-costrow">
+                <div class="ts-ab-block-primary">
+                  <div class="ts-ab-cost ts-tnum">
+                    {activeBlock.message_count}<span class="ts-ab-quota-sep"
+                      >/{quota}</span
+                    >
+                  </div>
+                  <div class="ts-ab-shadow ts-tnum">
+                    ~{fmtUSD(activeBlock.cost_usd)} equiv
+                  </div>
                 </div>
-                <div class="ts-ab-projlbl">projected total</div>
+                <div class="ts-ab-proj">
+                  <div class="ts-ab-projval ts-tnum">{projectedMsgs}</div>
+                  <div class="ts-ab-projlbl">msgs by reset</div>
+                </div>
               </div>
-            </div>
+            {:else}
+              <div class="ts-ab-costrow">
+                <div class="ts-ab-cost ts-tnum">{fmtUSD(activeBlock.cost_usd)}</div>
+                <div class="ts-ab-proj">
+                  <div class="ts-ab-projval ts-tnum">
+                    {fmtUSD(activeBlock.projected_block_usd)}
+                  </div>
+                  <div class="ts-ab-projlbl">projected total</div>
+                </div>
+              </div>
+            {/if}
             <div class="ts-ab-resetbar">
-              <div class="ts-ab-resetfill" style="width:{progress}%;"></div>
+              <div
+                class="ts-ab-resetfill"
+                style="width:{barPct}%;background:{barColor};"
+              ></div>
             </div>
             <div class="ts-ab-resetmeta ts-tnum">
-              <span>{Math.round(progress)}% elapsed</span>
+              <span>
+                {#if isSubs}
+                  <span style="color:var(--ts-tier-{quotaTier});"
+                    >{quotaPct.toFixed(0)}%</span
+                  > quota
+                {:else}
+                  {Math.round(timePct)}% elapsed
+                {/if}
+              </span>
               <span>resets in {fmtDuration(remaining)}</span>
             </div>
             <div class="ts-ab-stats">
               <div class="ts-ab-stat">
-                <div class="ts-ab-statlbl">BURN</div>
+                <div class="ts-ab-statlbl">{isSubs ? "PACE" : "BURN"}</div>
                 <Sparkline
                   data={synthBurnSeries(activeBlock.burn_usd_per_hr)}
                   width={120}
@@ -380,14 +523,28 @@
                   stroke={burnHot ? "var(--ts-accent)" : "var(--ts-text-3)"}
                 />
                 <div class="ts-ab-statval-sm ts-tnum">
-                  {fmtUSD(activeBlock.burn_usd_per_hr)}/hr
+                  {#if isSubs}
+                    {msgPerHr.toFixed(0)} msg/hr
+                  {:else}
+                    {fmtUSD(activeBlock.burn_usd_per_hr)}/hr
+                  {/if}
                 </div>
               </div>
               <div class="ts-ab-stat">
-                <div class="ts-ab-statlbl">MESSAGES</div>
-                <div class="ts-ab-statval ts-tnum">{activeBlock.message_count}</div>
+                <div class="ts-ab-statlbl">{isSubs ? "TOKENS" : "MESSAGES"}</div>
+                <div class="ts-ab-statval ts-tnum">
+                  {#if isSubs}
+                    {fmtTokensShort(totalTokens(activeBlock.tokens))}
+                  {:else}
+                    {activeBlock.message_count}
+                  {/if}
+                </div>
                 <div class="ts-ab-statval-sm ts-tnum">
-                  {fmtTokensShort(totalTokens(activeBlock.tokens))} tok
+                  {#if isSubs}
+                    {activeBlock.message_count} msgs
+                  {:else}
+                    {fmtTokensShort(totalTokens(activeBlock.tokens))} tok
+                  {/if}
                 </div>
               </div>
               <div class="ts-ab-stat">
@@ -409,18 +566,25 @@
               <span>window</span>
               <span class="ts-tnum ts-bt-r">msgs</span>
               <span class="ts-bt-r">tokens</span>
-              <span class="ts-bt-r">cost</span>
+              <span class="ts-bt-r" class:ts-text3={isSubs}>cost</span>
             </div>
             {#each recentBlocks as b (b.start_ms)}
               <div class="ts-bt-row">
                 <span class="ts-mono ts-tnum"
                   >{fmtClock(b.start_ms)}–{fmtClock(b.end_ms)}</span
                 >
-                <span class="ts-tnum ts-bt-r">{b.message_count}</span>
+                <span
+                  class="ts-tnum ts-bt-r"
+                  class:ts-bt-cost={isSubs}>{b.message_count}</span
+                >
                 <span class="ts-tnum ts-bt-r ts-text2"
                   >{fmtTokensShort(totalTokens(b.tokens))}</span
                 >
-                <span class="ts-tnum ts-bt-r ts-bt-cost">{fmtUSD(b.cost_usd)}</span>
+                <span
+                  class="ts-tnum ts-bt-r"
+                  class:ts-bt-cost={!isSubs}
+                  class:ts-text3={isSubs}>{fmtUSD(b.cost_usd)}</span
+                >
               </div>
             {/each}
           </div>
@@ -433,27 +597,81 @@
     {:else if tab === "settings"}
       <div class="ts-tabbody ts-settings">
         <div class="ts-set-field">
-          <label class="ts-set-label" for="budget-input"
-            >Budget alert threshold</label
-          >
-          <div class="ts-set-inputrow">
-            <span class="ts-set-prefix">$</span>
-            <input
-              id="budget-input"
-              class="ts-set-input ts-tnum"
-              type="number"
-              min="0"
-              step="1"
-              bind:value={settings.budget_window_usd}
-              onchange={saveSettings}
-            />
-            <span class="ts-set-suffix">/ 5h block</span>
+          <div class="ts-set-label">Plan</div>
+          <div class="ts-plan-seg">
+            {#each ["api", "pro", "max-5x", "max-20x"] as const as p}
+              <button
+                class="ts-plan-opt"
+                class:is-on={settings.plan === p}
+                onclick={() => {
+                  settings.plan = p;
+                  saveSettings();
+                }}
+              >
+                {PLAN_LABEL[p]}
+              </button>
+            {/each}
           </div>
           <div class="ts-set-hint">
-            Notify when projected block cost crosses this.
-            <span class="ts-mono">0</span> disables alerts.
+            {#if settings.plan === "api"}
+              Per-token cost via Anthropic API. Tokenscope shows USD and burn rate.
+            {:else}
+              Flat-fee subscription. Tokenscope shows messages and % of estimated
+              {quota}-msg/5h quota.
+              <span class="ts-mono">*</span> community estimate — actual limit may differ.
+            {/if}
           </div>
         </div>
+
+        <div class="ts-set-divider"></div>
+
+        {#if isSubs}
+          <div class="ts-set-field">
+            <label class="ts-set-label" for="rate-input"
+              >Rate-limit warning</label
+            >
+            <div class="ts-set-inputrow">
+              <input
+                id="rate-input"
+                class="ts-set-input ts-tnum"
+                type="number"
+                min="0"
+                max="100"
+                step="5"
+                bind:value={settings.rate_limit_warn_pct}
+                onchange={saveSettings}
+              />
+              <span class="ts-set-suffix">% of quota</span>
+            </div>
+            <div class="ts-set-hint">
+              Notify when messages used in current 5h window cross this %.
+              <span class="ts-mono">0</span> disables alerts.
+            </div>
+          </div>
+        {:else}
+          <div class="ts-set-field">
+            <label class="ts-set-label" for="budget-input"
+              >Budget alert threshold</label
+            >
+            <div class="ts-set-inputrow">
+              <span class="ts-set-prefix">$</span>
+              <input
+                id="budget-input"
+                class="ts-set-input ts-tnum"
+                type="number"
+                min="0"
+                step="1"
+                bind:value={settings.budget_window_usd}
+                onchange={saveSettings}
+              />
+              <span class="ts-set-suffix">/ 5h block</span>
+            </div>
+            <div class="ts-set-hint">
+              Notify when projected block cost crosses this.
+              <span class="ts-mono">0</span> disables alerts.
+            </div>
+          </div>
+        {/if}
 
         <div class="ts-set-divider"></div>
 
@@ -536,6 +754,13 @@
     font-weight: 650;
     line-height: 1;
     letter-spacing: -0.5px;
+  }
+  .ts-hero-quota-sep {
+    font-size: 0.55em;
+    color: var(--ts-text-3);
+    font-weight: 500;
+    margin-left: 4px;
+    letter-spacing: 0;
   }
   .ts-hero-proj {
     font-size: 12px;
@@ -747,6 +972,12 @@
     font-weight: 600;
     font-size: 14px;
   }
+  .ts-card-unit {
+    font-size: 0.72em;
+    color: var(--ts-text-3);
+    font-weight: 500;
+    margin-left: 2px;
+  }
   .ts-card-ctx {
     display: flex;
     align-items: center;
@@ -853,6 +1084,12 @@
     max-width: 230px;
     direction: rtl;
   }
+  .ts-drow-v-wrap {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    flex: 0 1 auto;
+  }
 
   /* active block */
   .ts-activeblock {
@@ -909,6 +1146,26 @@
     font-weight: 650;
     line-height: 1;
     letter-spacing: -0.6px;
+  }
+  .ts-ab-quota-sep {
+    font-size: 0.5em;
+    color: var(--ts-text-3);
+    font-weight: 500;
+    margin-left: 4px;
+    letter-spacing: 0;
+  }
+  .ts-ab-block-primary {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .ts-ab-shadow {
+    font-size: 11px;
+    color: var(--ts-text-3);
+    font-weight: 500;
+  }
+  .ts-text3 {
+    color: var(--ts-text-3);
   }
   .ts-ab-proj {
     text-align: right;
@@ -1116,5 +1373,37 @@
   .ts-set-input::-webkit-outer-spin-button {
     -webkit-appearance: none;
     margin: 0;
+  }
+
+  /* plan segmented control */
+  .ts-plan-seg {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--ts-surface-2);
+    border: 1px solid var(--ts-border-2);
+    border-radius: 8px;
+    padding: 2px;
+    max-width: 320px;
+  }
+  .ts-plan-opt {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-family: var(--ts-font);
+    font-size: 12px;
+    color: var(--ts-text-2);
+    padding: 6px 4px;
+    border-radius: 6px;
+    transition: 0.1s;
+  }
+  .ts-plan-opt:hover {
+    color: var(--ts-text-1);
+  }
+  .ts-plan-opt.is-on {
+    background: var(--ts-surface-hi);
+    color: var(--ts-text-1);
+    font-weight: 550;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
   }
 </style>

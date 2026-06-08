@@ -13,6 +13,8 @@
     cpu: "M9 9h6v6H9z M4 9h2 M4 15h2 M18 9h2 M18 15h2 M9 4v2 M15 4v2 M9 18v2 M15 18v2 M6 6h12v12H6z",
     layers: "M12 2 2 7l10 5 10-5-10-5 M2 17l10 5 10-5 M2 12l10 5 10-5",
     list: "M8 6h13 M8 12h13 M8 18h13 M3 6h.01 M3 12h.01 M3 18h.01",
+    copy: "M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2 M15 2H9a1 1 0 0 0-1 1v2a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1z",
+    check: "M20 6 9 17l-5-5",
   };
 
   export function iconPaths(name: string): string[] {
