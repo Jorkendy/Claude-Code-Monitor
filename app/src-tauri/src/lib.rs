@@ -977,8 +977,10 @@ pub fn run() {
             // Menubar UX: clicking anywhere outside the popover dismisses it.
             // 200ms debounce so transient focus losses (notifications, tray
             // re-toggle) don't accidentally dismiss it — if the window regains
-            // focus before the timer fires, we skip the hide.
-            WindowEvent::Focused(false) => {
+            // focus before the timer fires, we skip the hide. Only applies
+            // to the popover ("main"); the dashboard is a real window the
+            // user expects to keep open alongside other apps.
+            WindowEvent::Focused(false) if window.label() == "main" => {
                 let window = window.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_millis(200));
