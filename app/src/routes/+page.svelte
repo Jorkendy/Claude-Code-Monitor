@@ -62,6 +62,7 @@
     custom_quota: number | null;
     theme: Theme;
     first_run: boolean;
+    show_in_dock: boolean;
   };
   type Tab = "sessions" | "blocks" | "settings";
 
@@ -90,6 +91,7 @@
     custom_quota: null,
     theme: "system",
     first_run: true,
+    show_in_dock: false,
   });
   let loading = $state(true);
   let error: string | null = $state(null);
@@ -892,35 +894,6 @@
       </div>
     {:else if tab === "settings"}
       <div class="ts-tabbody ts-settings">
-        <div class="ts-set-field">
-          <div class="ts-set-label">Plan</div>
-          <div class="ts-plan-seg">
-            {#each ["api", "pro", "max-5x", "max-20x"] as const as p}
-              <button
-                class="ts-plan-opt"
-                class:is-on={settings.plan === p}
-                onclick={() => {
-                  settings.plan = p;
-                  saveSettings();
-                }}
-              >
-                {PLAN_LABEL[p]}
-              </button>
-            {/each}
-          </div>
-          <div class="ts-set-hint">
-            {#if settings.plan === "api"}
-              Per-token cost via Anthropic API. Tokenscope shows USD and burn rate.
-            {:else}
-              Flat-fee subscription. Tokenscope shows messages and % of estimated
-              {quota}-msg/5h quota.
-              <span class="ts-mono">*</span> community estimate — actual limit may differ.
-            {/if}
-          </div>
-        </div>
-
-        <div class="ts-set-divider"></div>
-
         {#if isSubs}
           <div class="ts-set-field">
             <label class="ts-set-label" for="rate-input"
@@ -942,29 +915,6 @@
             <div class="ts-set-hint">
               Notify when messages used in current 5h window cross this %.
               <span class="ts-mono">0</span> disables alerts.
-            </div>
-          </div>
-
-          <div class="ts-set-field">
-            <label class="ts-set-label" for="quota-input"
-              >Custom quota</label
-            >
-            <div class="ts-set-inputrow">
-              <input
-                id="quota-input"
-                class="ts-set-input ts-tnum"
-                type="number"
-                min="0"
-                step="5"
-                placeholder={String(baseQuota ?? 0)}
-                bind:value={settings.custom_quota}
-                onchange={saveSettings}
-              />
-              <span class="ts-set-suffix">msgs / 5h</span>
-            </div>
-            <div class="ts-set-hint">
-              Override the community estimate ({baseQuota} for {PLAN_LABEL[settings.plan]})
-              with your measured limit. <span class="ts-mono">0</span> or empty falls back to default.
             </div>
           </div>
         {:else}
@@ -992,6 +942,78 @@
           </div>
         {/if}
 
+        <div class="ts-set-note">
+          <Icon name="folder" size={14} />
+          <div>
+            <div class="ts-set-note-k">Pricing source</div>
+            <div class="ts-set-note-v ts-mono">~/.config/tokenscope/pricing.toml</div>
+          </div>
+        </div>
+        <div class="ts-set-note">
+          <Icon name="cpu" size={14} />
+          <div>
+            <div class="ts-set-note-k">Data source</div>
+            <div class="ts-set-note-v ts-mono">
+              ~/.claude/ · local only, never uploaded
+            </div>
+          </div>
+        </div>
+
+        <div class="ts-set-divider"></div>
+        <div class="ts-set-section">ADVANCED</div>
+
+        <div class="ts-set-field">
+          <div class="ts-set-label">Plan</div>
+          <div class="ts-plan-seg">
+            {#each ["api", "pro", "max-5x", "max-20x"] as const as p}
+              <button
+                class="ts-plan-opt"
+                class:is-on={settings.plan === p}
+                onclick={() => {
+                  settings.plan = p;
+                  saveSettings();
+                }}
+              >
+                {PLAN_LABEL[p]}
+              </button>
+            {/each}
+          </div>
+          <div class="ts-set-hint">
+            {#if settings.plan === "api"}
+              Per-token cost via Anthropic API. Tokenscope shows USD and burn rate.
+            {:else}
+              Flat-fee subscription. Tokenscope shows messages and % of estimated
+              {quota}-msg/5h quota.
+              <span class="ts-mono">*</span> community estimate — actual limit may differ.
+            {/if}
+          </div>
+        </div>
+
+        {#if isSubs}
+          <div class="ts-set-field">
+            <label class="ts-set-label" for="quota-input"
+              >Custom quota</label
+            >
+            <div class="ts-set-inputrow">
+              <input
+                id="quota-input"
+                class="ts-set-input ts-tnum"
+                type="number"
+                min="0"
+                step="5"
+                placeholder={String(baseQuota ?? 0)}
+                bind:value={settings.custom_quota}
+                onchange={saveSettings}
+              />
+              <span class="ts-set-suffix">msgs / 5h</span>
+            </div>
+            <div class="ts-set-hint">
+              Override the community estimate ({baseQuota} for {PLAN_LABEL[settings.plan]})
+              with your measured limit. <span class="ts-mono">0</span> or empty falls back to default.
+            </div>
+          </div>
+        {/if}
+
         <div class="ts-set-field">
           <label class="ts-set-label" for="ctx-warn-input"
             >Context warning</label
@@ -1015,8 +1037,6 @@
           </div>
         </div>
 
-        <div class="ts-set-divider"></div>
-
         <div class="ts-set-field">
           <div class="ts-set-label">Appearance</div>
           <div class="ts-plan-seg">
@@ -1038,7 +1058,32 @@
           </div>
         </div>
 
-        <div class="ts-set-divider"></div>
+        <div class="ts-set-field">
+          <div class="ts-set-label">Show in Dock</div>
+          <div class="ts-plan-seg ts-seg-2">
+            <button
+              class="ts-plan-opt"
+              class:is-on={!settings.show_in_dock}
+              onclick={() => {
+                settings.show_in_dock = false;
+                saveSettings();
+              }}
+            >Menubar only</button>
+            <button
+              class="ts-plan-opt"
+              class:is-on={settings.show_in_dock}
+              onclick={() => {
+                settings.show_in_dock = true;
+                saveSettings();
+              }}
+            >Show in Dock</button>
+          </div>
+          <div class="ts-set-hint">
+            <span class="ts-mono">Menubar only</span> = pure menubar app (no Dock /
+            Cmd-Tab icon). <span class="ts-mono">Show in Dock</span> shows the
+            Tokenscope icon in the Dock so you can recognize and switch to it.
+          </div>
+        </div>
 
         <div class="ts-set-note">
           <Icon name="keyboard" size={14} />
@@ -1049,23 +1094,6 @@
               tabs · <span class="ts-mono">R</span> refresh ·
               <span class="ts-mono">D</span> dashboard ·
               <span class="ts-mono">Esc</span> collapse
-            </div>
-          </div>
-        </div>
-
-        <div class="ts-set-note">
-          <Icon name="folder" size={14} />
-          <div>
-            <div class="ts-set-note-k">Pricing source</div>
-            <div class="ts-set-note-v ts-mono">~/.config/tokenscope/pricing.toml</div>
-          </div>
-        </div>
-        <div class="ts-set-note">
-          <Icon name="cpu" size={14} />
-          <div>
-            <div class="ts-set-note-k">Data source</div>
-            <div class="ts-set-note-v ts-mono">
-              ~/.claude/ · local only, never uploaded
             </div>
           </div>
         </div>
@@ -1756,6 +1784,13 @@
     background: var(--ts-border);
     margin: 20px 0;
   }
+  .ts-set-section {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    color: var(--ts-text-3);
+    margin: -8px 0 14px;
+  }
   .ts-set-note {
     display: flex;
     gap: 11px;
@@ -1795,6 +1830,9 @@
     border-radius: 8px;
     padding: 2px;
     max-width: 320px;
+  }
+  .ts-seg-2 {
+    grid-template-columns: repeat(2, 1fr);
   }
   .ts-plan-opt {
     background: transparent;

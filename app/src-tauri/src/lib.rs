@@ -45,6 +45,10 @@ struct Settings {
     /// first-run modal.
     #[serde(default = "default_true")]
     first_run: bool,
+    /// Show app icon in the macOS Dock + Cmd+Tab list. False (default)
+    /// = pure menubar app (Accessory). Toggled at runtime.
+    #[serde(default)]
+    show_in_dock: bool,
 }
 
 fn default_plan() -> String {
@@ -73,6 +77,7 @@ impl Default for Settings {
             custom_quota: None,
             theme: default_theme(),
             first_run: true,
+            show_in_dock: false,
         }
     }
 }
@@ -179,6 +184,17 @@ fn set_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     let path = settings_path(&app).ok_or("no config dir")?;
     let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    // Live-apply the dock policy so the user sees the change without
+    // restarting. NSApp `setActivationPolicy:` is safe to call repeatedly.
+    #[cfg(target_os = "macos")]
+    {
+        let policy = if settings.show_in_dock {
+            ActivationPolicy::Regular
+        } else {
+            ActivationPolicy::Accessory
+        };
+        let _ = app.set_activation_policy(policy);
+    }
     // Notify other windows so the dashboard picks up theme / plan changes
     // without waiting for the next filesystem-watcher tick.
     let _ = app.emit("data-changed", ());
@@ -918,8 +934,18 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            // Apply the saved dock policy on startup. Accessory hides the
+            // app from the Dock + Cmd+Tab (menubar-only); Regular shows it.
             #[cfg(target_os = "macos")]
-            let _ = app.set_activation_policy(ActivationPolicy::Accessory);
+            {
+                let s = load_settings(&app.handle());
+                let policy = if s.show_in_dock {
+                    ActivationPolicy::Regular
+                } else {
+                    ActivationPolicy::Accessory
+                };
+                let _ = app.set_activation_policy(policy);
+            }
 
             let quit = MenuItem::with_id(app, "quit", "Quit Tokenscope", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
