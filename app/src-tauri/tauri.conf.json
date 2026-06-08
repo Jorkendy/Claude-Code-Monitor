@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "cc-monitor",
+  "productName": "Tokenscope",
   "version": "0.1.0",
-  "identifier": "com.ccmonitor.app",
+  "identifier": "com.tokenscope.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "cc-monitor",
+        "title": "Tokenscope",
         "width": 460,
         "height": 620,
         "visible": false,

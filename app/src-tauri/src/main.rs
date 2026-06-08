@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    cc_monitor_app_lib::run()
+    tokenscope_app_lib::run()
 }

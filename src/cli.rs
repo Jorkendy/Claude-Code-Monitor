@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::{api, blocks, cache, model::SessionRow, parser, pricing, renderer, scanner};
 
 #[derive(Parser, Debug)]
-#[command(name = "cc-monitor", about = "Claude Code session monitor (read-only)")]
+#[command(name = "tokenscope", about = "Tokenscope — Claude Code session monitor (read-only)")]
 pub struct Args {
     /// Override ~/.claude root path
     #[arg(long, env = "CLAUDE_HOME")]

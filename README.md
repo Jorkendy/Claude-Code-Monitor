@@ -1,20 +1,22 @@
-# cc-monitor
+# Tokenscope
+
+> Tokenscope was previously named `cc-monitor`. See [Migrating from cc-monitor](#migrating-from-cc-monitor) below.
 
 Local-first usage monitor cho Claude Code. Đọc trực tiếp `~/.claude/`,
 hiển thị **tên session do bạn đặt (`/rename`)** thay vì UUID, kèm context
 window %, burn rate USD/hr, projection cho block 5h, và cost ước tính —
-trong CLI hoặc macOS menubar app.
+trong CLI hoặc macOS menubar app + Dashboard window.
 
 Hoàn toàn offline. Read-only với mọi file trong `~/.claude/` (trừ cache
 riêng của tool).
 
 ---
 
-## Tại sao dùng cc-monitor
+## Tại sao dùng Tokenscope
 
 Bảng so sánh với các tool cùng loại (state-of-the-art ngày 2026-06):
 
-| Tính năng | cc-monitor | ccusage | claude-code-usage-monitor | cclog-cli |
+| Tính năng | Tokenscope | ccusage | claude-code-usage-monitor | cclog-cli |
 |---|---|---|---|---|
 | Hiển thị tên `/rename` thay vì UUID | ✓ | ✗ | ✗ | ✗ |
 | PID liveness (`active`/`idle`/`inactive`) | ✓ | ✗ | ✗ | ✗ |
@@ -26,6 +28,9 @@ Bảng so sánh với các tool cùng loại (state-of-the-art ngày 2026-06):
 | **Burn rate USD/hr live** | ✓ | ✗ | ✗ | ✗ |
 | **Block projection (est. total at reset)** | ✓ | ✗ | ✗ | ✗ |
 | **Proactive budget alert (notify trước khi vượt)** | ✓ | ✗ | ✗ | ✗ |
+| **Dashboard window (full table, sort/search/filter)** | ✓ | ✗ | ✗ | ✗ |
+| **Per-repo rollup** | ✓ | ✗ | ✗ | ✗ |
+| **Soft-hide & hard-delete sessions** | ✓ | ✗ | ✗ | ✗ |
 | macOS menubar app | ✓ | ✗ | ✗ | ✗ |
 | Native macOS notifications | ✓ | ✗ | ✗ | ✗ |
 | Filesystem watcher (auto-refresh) | ✓ | ✗ | partial | ✗ |
@@ -33,7 +38,7 @@ Bảng so sánh với các tool cùng loại (state-of-the-art ngày 2026-06):
 | Hoàn toàn offline | ✓ | ✓ | ✓ | ✓ |
 | Runtime | Single Rust binary | Node | Python | Rust |
 
-Khác biệt cốt lõi: chỉ cc-monitor đọc `~/.claude/sessions/{pid}.json` —
+Khác biệt cốt lõi: chỉ Tokenscope đọc `~/.claude/sessions/{pid}.json` —
 file chứa tên `/rename`, PID, cwd. Các tool khác chỉ đọc
 `~/.claude/projects/` (transcript-only) nên không có tên thật, không
 phân biệt được session đang chạy vs đã đóng.
@@ -42,7 +47,7 @@ phân biệt được session đang chạy vs đã đóng.
 
 ## Tính năng
 
-### CLI (`cc-monitor`)
+### CLI (`tokenscope`)
 
 - **Session table** với cột UID / NAME / REPO / STATUS / TOTAL / SUBS /
   COST / MODEL.
@@ -54,7 +59,7 @@ phân biệt được session đang chạy vs đã đóng.
 - **JSON output** (`--json`) để pipe / tích hợp.
 - **Incremental cache** ~5ms warm parse, đầu chạy 80–500ms.
 
-### Menubar app (macOS)
+### Menubar popover (macOS)
 
 - **Tray title** luôn hiện `$cost · $burn/hr · N live` ngay trên menubar.
 - **Sessions tab** — card list, mỗi card:
@@ -64,7 +69,7 @@ phân biệt được session đang chạy vs đã đóng.
     (xanh <50% → vàng <75% → cam <90% → đỏ ≥90%).
   - Tự append `#<uid-prefix>` khi 2+ session trùng tên.
   - Click expand → grid chi tiết (UID, PID, cwd, model, breakdown 4
-    loại tokens, subagents, updated relative).
+    loại tokens, subagents, updated relative) + nút "Hide from popover".
   - Default chỉ hiện active+idle; toggle "Show N inactive".
 - **Blocks tab**:
   - **Active block card** nổi bật ở top: cost lớn, badge "ACTIVE 5H
@@ -81,6 +86,29 @@ phân biệt được session đang chạy vs đã đóng.
   - **Reactive**: cost vượt threshold → "Current 5h block at $X.XX".
   - **Proactive**: projection > threshold trước khi cost vượt →
     "Block trending to $XX by reset" — 1 lần/block.
+- **Nút `⛶` mở Dashboard** ở header.
+
+### Dashboard window
+
+Nút `⛶` từ popover hoặc Tauri command `open_dashboard` mở window
+1000×720, resizable. Để xem sâu thay vì view nhanh.
+
+- **Tab Sessions** — full table:
+  - Search box: tìm theo name / UID / cwd / model.
+  - Filter: status (all / live / inactive), repo dropdown.
+  - Toggle "Show hidden" + nút "Unhide all".
+  - Sortable theo 8 cột (click header).
+  - Click name row → expand inline với UID/PID/cwd/breakdown 4 token
+    main + 4 token subagent.
+  - Mỗi row có nút **Hide** + **Delete**.
+  - **Delete** chỉ enable cho session inactive (2-step confirm). Xoá
+    `~/.claude/projects/{slug}/{uuid}.jsonl` + folder subagents +
+    `~/.claude/sessions/{pid}.json` (nếu match).
+  - Optimistic update + background refresh → scroll position giữ
+    nguyên sau delete/hide.
+- **Tab Repos** — rollup theo basename(cwd):
+  - Sessions count / live count / total tokens / total cost / top model.
+  - Sorted by total cost desc.
 
 ---
 
@@ -103,7 +131,7 @@ cd Claude-Code-Monitor
 cargo install --path .
 ```
 
-Binary cài tại `~/.cargo/bin/cc-monitor`.
+Binary cài tại `~/.cargo/bin/tokenscope`.
 
 ### Menubar app
 
@@ -117,22 +145,23 @@ pnpm install
 pnpm tauri build
 ```
 
-Output: `app/src-tauri/target/release/bundle/dmg/cc-monitor_0.1.0_aarch64.dmg`
-và `.../bundle/macos/cc-monitor.app`.
+Output: `app/src-tauri/target/release/bundle/dmg/Tokenscope_0.1.0_aarch64.dmg`
+và `.../bundle/macos/Tokenscope.app`.
 
 Cài:
 
-1. Mở file `.dmg` → drag `cc-monitor.app` vào `/Applications`.
-2. (Hoặc copy thẳng) `cp -R app/src-tauri/target/release/bundle/macos/cc-monitor.app /Applications/`.
+1. Mở file `.dmg` → drag `Tokenscope.app` vào `/Applications`.
+2. (Hoặc copy thẳng) `cp -R app/src-tauri/target/release/bundle/macos/Tokenscope.app /Applications/`.
 3. Mở từ Spotlight / Launchpad — lần đầu macOS hỏi "open from untrusted
    developer" → Right-click app → Open → Open (vì build chưa ký notarize).
-4. Icon "C" hiện trên menubar. Click để mở popover.
+4. Icon "C" hiện trên menubar. Click để mở popover. Click nút `⛶` để
+   mở Dashboard.
 
 Đặt mở cùng đăng nhập: System Settings → General → Login Items → thêm
-`cc-monitor.app`.
+`Tokenscope.app`.
 
-Gỡ: `rm -rf /Applications/cc-monitor.app` (settings file ở
-`~/Library/Application Support/com.ccmonitor.app/` xoá thủ công nếu muốn).
+Gỡ: `rm -rf /Applications/Tokenscope.app` (settings file ở
+`~/Library/Application Support/com.tokenscope.app/` xoá thủ công nếu muốn).
 
 **Chạy dev (hot reload, không cài vào Applications)**
 
@@ -149,17 +178,17 @@ Chỉ chạy khi terminal còn mở. Đóng terminal → app tắt.
 ## Dùng CLI
 
 ```sh
-cc-monitor                          # bảng mặc định, sort total desc
-cc-monitor --sort cost              # sort theo cost USD
-cc-monitor --sort updated           # sort theo updatedAt
-cc-monitor --sort name              # sort alphabet
-cc-monitor --repo Work              # filter theo basename của cwd
-cc-monitor --include-cache-read     # cộng cache_read vào TOTAL
-cc-monitor --full                   # số đầy đủ thay vì 55.7K
-cc-monitor --json                   # JSON cho integration
-cc-monitor --subagents <UUID-PREFIX> # drill-down subagent
-cc-monitor --blocks                 # 5h billing blocks
-cc-monitor --root /path/to/.claude  # override $HOME/.claude
+tokenscope                          # bảng mặc định, sort total desc
+tokenscope --sort cost              # sort theo cost USD
+tokenscope --sort updated           # sort theo updatedAt
+tokenscope --sort name              # sort alphabet
+tokenscope --repo Work              # filter theo basename của cwd
+tokenscope --include-cache-read     # cộng cache_read vào TOTAL
+tokenscope --full                   # số đầy đủ thay vì 55.7K
+tokenscope --json                   # JSON cho integration
+tokenscope --subagents <UUID-PREFIX> # drill-down subagent
+tokenscope --blocks                 # 5h billing blocks
+tokenscope --root /path/to/.claude  # override $HOME/.claude
 ```
 
 `--subagents` chấp nhận UUID prefix (vd `48db5a8f`).
@@ -170,12 +199,14 @@ cc-monitor --root /path/to/.claude  # override $HOME/.claude
 
 - Click icon "C" trên menubar → popover.
 - Click ra ngoài → popover ẩn (200ms debounce).
-- Right-click icon → menu Quit.
+- Right-click icon → menu Quit Tokenscope.
 - Tab Sessions: xem live sessions, click card để chi tiết.
 - Tab Blocks: xem block 5h hiện tại + lịch sử gần.
 - Tab Settings: chỉnh budget threshold.
+- Nút `⛶` trên header → mở Dashboard window cho thao tác sâu.
 
-Settings lưu tại `~/Library/Application Support/com.ccmonitor.app/settings.json`.
+Settings lưu tại `~/Library/Application Support/com.tokenscope.app/settings.json`.
+Hidden sessions ở cùng folder, file `hidden_sessions.json`.
 
 ---
 
@@ -227,7 +258,7 @@ Proactive alert bắn khi `projection > threshold && cost < threshold`,
 
 ## Override pricing
 
-Tạo `~/.config/cc-monitor/pricing.toml`:
+Tạo `~/.config/tokenscope/pricing.toml`:
 
 ```toml
 [models.claude-opus-4-8]
@@ -249,7 +280,7 @@ Override merge vào default table, ưu tiên file user.
 
 ## Cache (incremental)
 
-Cache file: `~/.claude/.cc-monitor-cache.json`.
+Cache file: `~/.claude/.tokenscope-cache.json`.
 
 Lưu `{size, mtime_ms, byte_offset, tokens, model, latest_context_tokens,
 latest_ts_ms}` cho mỗi JSONL.
@@ -262,7 +293,7 @@ Parser chỉ advance `byte_offset` khi line kết thúc bằng `\n` để tránh
 double-count khi resume vào lúc file đang được ghi dở.
 
 Thay đổi schema cache (vd thêm field) → tự đọc lại nhờ `#[serde(default)]`.
-Nếu muốn force re-parse: `rm ~/.claude/.cc-monitor-cache.json`.
+Nếu muốn force re-parse: `rm ~/.claude/.tokenscope-cache.json`.
 
 ---
 
@@ -271,7 +302,7 @@ Nếu muốn force re-parse: `rm ~/.claude/.cc-monitor-cache.json`.
 - **Cost chỉ là ước tính**:
   - Per-token rate. Nếu bạn dùng Pro/Max subscription, hoá đơn thật
     **không bằng** số này (subscription cố định, không tính per-token).
-    Cost trong cc-monitor là "nếu trả per-token API".
+    Cost trong Tokenscope là "nếu trả per-token API".
   - `cache_creation_input_tokens` gộp cả 5-minute và 1-hour cache
     writes. Pricing dùng giá 5m (rẻ hơn). Session dùng nhiều 1h cache
     → cost thực cao hơn hiển thị.
@@ -289,6 +320,35 @@ Nếu muốn force re-parse: `rm ~/.claude/.cc-monitor-cache.json`.
   trong data, nên giữ 200K cho an toàn.
 - **Burn rate window 10 phút**: task mới start chưa đầy 1 phút sẽ chưa
   có burn rate ý nghĩa.
+- **Hard delete unsafe cho session live**: delete command từ chối khi
+  status ≠ Inactive để tránh yank file dưới chân Claude Code đang
+  chạy. Muốn xoá session live: dùng Hide UI.
+
+---
+
+## Migrating from cc-monitor
+
+Trước đây tool tên là `cc-monitor`. Nếu đã cài bản cũ:
+
+```sh
+# Gỡ binary CLI cũ
+rm -f ~/.cargo/bin/cc-monitor
+
+# Gỡ app cũ (nếu đã cài DMG)
+rm -rf /Applications/cc-monitor.app
+
+# Xoá settings folder cũ (mất budget threshold, hidden list — sẽ re-set
+# từ Settings tab khi mở Tokenscope lần đầu)
+rm -rf ~/Library/Application\ Support/com.ccmonitor.app
+
+# Xoá cache cũ trong .claude (harmless, sẽ tự build lại)
+rm -f ~/.claude/.cc-monitor-cache.json
+
+# Xoá config dir cũ nếu có pricing override (re-tạo ở ~/.config/tokenscope/)
+rm -rf ~/.config/cc-monitor
+```
+
+Rồi cài lại bình thường (xem [Cài đặt](#cài-đặt)).
 
 ---
 
@@ -326,7 +386,7 @@ src/
   model.rs      # Tokens, LiveStatus, SessionRow, UsageEvent
   scanner.rs    # walk 4 nguồn
   parser.rs     # streaming JSONL, drill .message.usage
-  joiner.rs    # merge theo sessionId
+  joiner.rs     # merge theo sessionId
   liveness.rs   # libc::kill(pid, 0)
   pricing.rs    # default table + TOML override + cost calc
   blocks.rs     # 5h block detection (port ccusage algorithm)
@@ -335,7 +395,8 @@ src/
 
 app/
   src/             # SvelteKit frontend
-    routes/+page.svelte  # tabs UI
+    routes/+page.svelte             # popover (menubar)
+    routes/dashboard/+page.svelte   # dashboard window
   src-tauri/
     src/
       lib.rs       # Tauri commands, tray, notifications, watcher hook
@@ -347,12 +408,14 @@ app/
 
 ## Safety
 
-- Read-only tuyệt đối với mọi file trong `~/.claude/` **TRỪ**
-  `~/.claude/.cc-monitor-cache.json` (file của tool).
+- Read-only tuyệt đối với mọi file trong `~/.claude/` **TRỪ**:
+  - `~/.claude/.tokenscope-cache.json` (cache).
+  - Khi user bấm Hard Delete cho session inactive: xoá transcript +
+    subagent folder + sessions/{pid}.json nếu match.
 - Không gửi data ra mạng — hoàn toàn local.
 - Không in token / secret.
 - Không update git config.
-- Settings file của app: `~/Library/Application Support/com.ccmonitor.app/settings.json`.
+- Settings file: `~/Library/Application Support/com.tokenscope.app/settings.json`.
 
 ---
 
@@ -362,9 +425,8 @@ app/
 
 - Per-session burn rate (biết session nào đang tốn khi tray cảnh báo).
 - Compaction stats (đếm `<synthetic>` per session + token wasted).
-- Per-repo rollup tab.
 - Daily/weekly sparkline trends.
-- CSV export.
+- CSV / JSON export từ Dashboard.
 - Linux + Windows support cho menubar app.
 
 ---

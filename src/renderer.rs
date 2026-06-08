@@ -85,7 +85,7 @@ pub fn render_table(rows: &[SessionRow], opts: &RenderOpts) -> Result<()> {
     println!(
         "Cost is an estimate (per-token rates, snapshot 2026-06). \
          Pro/Max subscription billing may differ. \
-         Override pricing at ~/.config/cc-monitor/pricing.toml."
+         Override pricing at ~/.config/tokenscope/pricing.toml."
     );
     Ok(())
 }

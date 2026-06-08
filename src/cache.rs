@@ -5,8 +5,9 @@
 //   size grew               -> seek to byte_offset, parse appended bytes, add
 //   anything else           -> full re-read (file shrank/rewritten/new)
 //
-// Cache file: <root>/.cc-monitor-cache.json — the only path the tool ever writes
-// inside CLAUDE_HOME (read-only guarantee from spec excludes our own cache).
+// Cache file: <root>/.tokenscope-cache.json — the only path the tool ever
+// writes inside CLAUDE_HOME (read-only guarantee from spec excludes our
+// own cache).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,7 @@ use std::time::UNIX_EPOCH;
 use crate::model::Tokens;
 use crate::parser::{self, JsonlSummary};
 
-const CACHE_FILE: &str = ".cc-monitor-cache.json";
+const CACHE_FILE: &str = ".tokenscope-cache.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {

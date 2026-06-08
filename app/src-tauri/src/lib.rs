@@ -1,12 +1,14 @@
 mod watcher;
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use cc_monitor::{api, blocks::SessionBlock, model::SessionRow};
+use tokenscope::{api, blocks::SessionBlock, model::SessionRow};
 use serde::{Deserialize, Serialize};
 use tauri::{
-    ActivationPolicy, AppHandle, Manager, PhysicalPosition, WindowEvent,
+    ActivationPolicy, AppHandle, Emitter, Manager, PhysicalPosition, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
     image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -71,7 +73,7 @@ struct BlockView {
 #[tauri::command]
 fn list_block_views() -> Result<Vec<BlockView>, String> {
     let enriched = api::list_blocks_enriched(None).map_err(|e| e.to_string())?;
-    let table = cc_monitor::pricing::load();
+    let table = tokenscope::pricing::load();
     Ok(enriched
         .blocks
         .into_iter()
@@ -80,8 +82,8 @@ fn list_block_views() -> Result<Vec<BlockView>, String> {
                 .models
                 .iter()
                 .find(|m| !m.is_empty())
-                .and_then(|m| cc_monitor::pricing::lookup(&table, m))
-                .map(|p| cc_monitor::pricing::cost_usd(p, &b.tokens))
+                .and_then(|m| tokenscope::pricing::lookup(&table, m))
+                .map(|p| tokenscope::pricing::cost_usd(p, &b.tokens))
                 .unwrap_or(0.0);
             let (burn, projected) = if b.is_active {
                 enriched
@@ -115,6 +117,272 @@ fn set_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     Ok(())
 }
 
+// ---- Hidden sessions ----------------------------------------------------
+//
+// User-driven soft-delete: the file in ~/.claude/ stays put, we just stop
+// showing the session_id in either window. Persisted at
+// `app_config_dir/hidden_sessions.json`.
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct HiddenFile {
+    #[serde(default)]
+    ids: Vec<String>,
+}
+
+fn hidden_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    let dir = app.path().app_config_dir().ok()?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir.join("hidden_sessions.json"))
+}
+
+fn load_hidden(app: &AppHandle) -> HiddenFile {
+    let Some(path) = hidden_path(app) else {
+        return HiddenFile::default();
+    };
+    std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_hidden(app: &AppHandle, h: &HiddenFile) -> Result<(), String> {
+    let path = hidden_path(app).ok_or("no config dir")?;
+    let bytes = serde_json::to_vec_pretty(h).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_hidden(app: AppHandle) -> Vec<String> {
+    load_hidden(&app).ids
+}
+
+#[tauri::command]
+fn hide_session(app: AppHandle, session_id: String) -> Result<(), String> {
+    let mut h = load_hidden(&app);
+    if !h.ids.contains(&session_id) {
+        h.ids.push(session_id);
+        save_hidden(&app, &h)?;
+        let _ = app.emit("data-changed", ());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn unhide_session(app: AppHandle, session_id: String) -> Result<(), String> {
+    let mut h = load_hidden(&app);
+    let before = h.ids.len();
+    h.ids.retain(|id| id != &session_id);
+    if h.ids.len() != before {
+        save_hidden(&app, &h)?;
+        let _ = app.emit("data-changed", ());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn unhide_all(app: AppHandle) -> Result<(), String> {
+    let h = HiddenFile::default();
+    save_hidden(&app, &h)?;
+    let _ = app.emit("data-changed", ());
+    Ok(())
+}
+
+// ---- Hard delete -------------------------------------------------------
+//
+// Only inactive sessions can be hard-deleted — we refuse on active/idle to
+// avoid yanking transcript files out from under a running Claude Code
+// process. Two-step confirmation is enforced on the frontend; this command
+// trusts the caller has confirmed.
+
+#[derive(Debug, Serialize)]
+struct DeleteReport {
+    session_id: String,
+    files_removed: usize,
+    dirs_removed: usize,
+}
+
+#[tauri::command]
+fn delete_session_files(session_id: String) -> Result<DeleteReport, String> {
+    // Status guard: require inactive.
+    let rows = api::list_sessions(None).map_err(|e| e.to_string())?;
+    let row = rows
+        .iter()
+        .find(|r| r.session_id == session_id)
+        .ok_or_else(|| format!("session {session_id} not found"))?;
+    if !matches!(row.status, tokenscope::model::LiveStatus::Inactive) {
+        return Err(format!(
+            "refusing to delete: session is {:?}, only Inactive sessions are deletable",
+            row.status
+        ));
+    }
+
+    // Locate files by scanning ~/.claude/projects for matching basename.
+    // Belt-and-suspenders: we don't trust the slug→cwd reverse mapping.
+    let root = api::resolve_root(None).map_err(|e| e.to_string())?;
+    let projects = root.join("projects");
+    let mut files_removed = 0usize;
+    let mut dirs_removed = 0usize;
+    if let Ok(slugs) = std::fs::read_dir(&projects) {
+        for slug_entry in slugs.flatten() {
+            let slug_path = slug_entry.path();
+            if !slug_path.is_dir() {
+                continue;
+            }
+            // Transcript file: {session_id}.jsonl
+            let transcript = slug_path.join(format!("{session_id}.jsonl"));
+            if transcript.is_file() {
+                if let Err(e) = std::fs::remove_file(&transcript) {
+                    return Err(format!("remove {}: {e}", transcript.display()));
+                }
+                files_removed += 1;
+            }
+            // Subagent folder: {session_id}/
+            let subdir = slug_path.join(&session_id);
+            if subdir.is_dir() {
+                if let Err(e) = std::fs::remove_dir_all(&subdir) {
+                    return Err(format!("remove {}: {e}", subdir.display()));
+                }
+                dirs_removed += 1;
+            }
+        }
+    }
+
+    // Also drop the sessions/{pid}.json reference if any matches this id —
+    // but only if pid is no longer alive (status was inactive). Walk the
+    // sessions dir and remove json files whose `sessionId` matches.
+    let sessions_dir = root.join("sessions");
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&p) else { continue };
+            let Ok(v): serde_json::Result<serde_json::Value> = serde_json::from_slice(&bytes)
+            else {
+                continue;
+            };
+            if v.get("sessionId").and_then(|s| s.as_str()) == Some(&session_id) {
+                if let Err(e) = std::fs::remove_file(&p) {
+                    return Err(format!("remove {}: {e}", p.display()));
+                }
+                files_removed += 1;
+            }
+        }
+    }
+
+    // Invalidate our own cache so the next list_sessions reflects reality.
+    let cache_path = root.join(".tokenscope-cache.json");
+    let _ = std::fs::remove_file(&cache_path);
+
+    Ok(DeleteReport {
+        session_id,
+        files_removed,
+        dirs_removed,
+    })
+}
+
+// ---- Repo rollup -------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct RepoRollup {
+    repo: String,
+    session_count: usize,
+    live_count: usize,
+    total_cost_usd: f64,
+    total_tokens: u64,
+    top_model: Option<String>,
+}
+
+#[tauri::command]
+fn list_repo_rollups(app: AppHandle) -> Result<Vec<RepoRollup>, String> {
+    use std::collections::HashMap;
+    let rows = api::list_sessions(None).map_err(|e| e.to_string())?;
+    let hidden: HashSet<String> = load_hidden(&app).ids.into_iter().collect();
+
+    #[derive(Default)]
+    struct Acc {
+        session_count: usize,
+        live_count: usize,
+        cost: f64,
+        tokens: u64,
+        models: HashMap<String, u64>, // model → token volume, for top model
+    }
+    let mut map: HashMap<String, Acc> = HashMap::new();
+    for r in &rows {
+        if hidden.contains(&r.session_id) {
+            continue;
+        }
+        let repo = r
+            .cwd
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("-")
+            .to_string();
+        let a = map.entry(repo).or_default();
+        a.session_count += 1;
+        if matches!(
+            r.status,
+            tokenscope::model::LiveStatus::Active | tokenscope::model::LiveStatus::Idle
+        ) {
+            a.live_count += 1;
+        }
+        a.cost += r.cost_usd.unwrap_or(0.0);
+        let row_tokens = r.tokens.input + r.tokens.output + r.tokens.cache_creation;
+        a.tokens += row_tokens;
+        if let Some(m) = &r.model {
+            *a.models.entry(m.clone()).or_insert(0) += row_tokens;
+        }
+    }
+
+    let mut out: Vec<RepoRollup> = map
+        .into_iter()
+        .map(|(repo, a)| {
+            let top_model = a
+                .models
+                .iter()
+                .max_by_key(|(_, v)| *v)
+                .map(|(k, _)| k.clone());
+            RepoRollup {
+                repo,
+                session_count: a.session_count,
+                live_count: a.live_count,
+                total_cost_usd: a.cost,
+                total_tokens: a.tokens,
+                top_model,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.total_cost_usd
+            .partial_cmp(&a.total_cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(out)
+}
+
+// ---- Dashboard window --------------------------------------------------
+
+#[tauri::command]
+fn open_dashboard(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("dashboard") {
+        let _ = win.show();
+        let _ = win.set_focus();
+        let _ = win.unminimize();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(&app, "dashboard", WebviewUrl::App("dashboard".into()))
+        .title("Tokenscope — Dashboard")
+        .inner_size(1000.0, 720.0)
+        .min_inner_size(720.0, 480.0)
+        .resizable(true)
+        .visible(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn active_burn() -> Option<api::ActiveBurn> {
     api::list_blocks_enriched(None).ok()?.active
 }
@@ -129,7 +397,7 @@ fn tray_title() -> String {
                 .filter(|r| {
                     matches!(
                         r.status,
-                        cc_monitor::model::LiveStatus::Active | cc_monitor::model::LiveStatus::Idle
+                        tokenscope::model::LiveStatus::Active | tokenscope::model::LiveStatus::Idle
                     )
                 })
                 .count()
@@ -188,7 +456,7 @@ fn check_budget(app: &AppHandle) {
             let res = app
                 .notification()
                 .builder()
-                .title("cc-monitor — projected over budget")
+                .title("Tokenscope — projected over budget")
                 .body(format!(
                     "Block trending to ${projected:.2} by reset (threshold ${:.2}, burn ${:.0}/hr)",
                     settings.budget_window_usd, burn.burn_usd_per_hr
@@ -209,7 +477,7 @@ fn check_budget(app: &AppHandle) {
         let res = app
             .notification()
             .builder()
-            .title("cc-monitor")
+            .title("Tokenscope")
             .body(format!(
                 "Current 5h block at ${cost:.2} (threshold ${:.2})",
                 settings.budget_window_usd
@@ -245,7 +513,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             let _ = app.set_activation_policy(ActivationPolicy::Accessory);
 
-            let quit = MenuItem::with_id(app, "quit", "Quit cc-monitor", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit Tokenscope", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
 
             // Custom monochrome "C" icon for the menubar, rendered as a
@@ -318,6 +586,13 @@ pub fn run() {
             list_block_views,
             get_settings,
             set_settings,
+            list_hidden,
+            hide_session,
+            unhide_session,
+            unhide_all,
+            delete_session_files,
+            list_repo_rollups,
+            open_dashboard,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

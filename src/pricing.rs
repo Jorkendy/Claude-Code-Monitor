@@ -2,7 +2,7 @@
 //
 // Defaults sourced from platform.claude.com/docs/en/about-claude/pricing
 // (snapshot 2026-06). Users can override / extend via
-// `~/.config/cc-monitor/pricing.toml`:
+// `~/.config/tokenscope/pricing.toml`:
 //
 //   [models.claude-opus-4-8]
 //   input = 5.0
@@ -97,7 +97,7 @@ struct OverrideFile {
 }
 
 fn load_overrides() -> Option<HashMap<String, ModelPricing>> {
-    let path = dirs::config_dir()?.join("cc-monitor/pricing.toml");
+    let path = dirs::config_dir()?.join("tokenscope/pricing.toml");
     let text = fs::read_to_string(&path).ok()?;
     let parsed: OverrideFile = toml::from_str(&text).ok()?;
     Some(parsed.models)

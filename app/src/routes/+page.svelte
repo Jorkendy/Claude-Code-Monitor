@@ -55,7 +55,29 @@
   let showAllSessions = $state(false);
   let showAllBlocks = $state(false);
   let expandedId: string | null = $state(null);
+  let hidden: Set<string> = $state(new Set());
   const DONE_BLOCKS_DEFAULT = 5;
+
+  async function refreshHidden() {
+    try {
+      const ids = await invoke<string[]>("list_hidden");
+      hidden = new Set(ids);
+    } catch (e) {
+      // non-fatal: hidden filter just doesn't apply
+      console.error(e);
+    }
+  }
+
+  async function hideSession(id: string) {
+    await invoke("hide_session", { sessionId: id });
+    expandedId = null;
+    // data-changed event will reload; refresh hidden set proactively
+    await refreshHidden();
+  }
+
+  async function openDashboard() {
+    await invoke("open_dashboard");
+  }
 
   function toggleExpand(id: string) {
     expandedId = expandedId === id ? null : id;
@@ -79,11 +101,16 @@
     try {
       loading = true;
       error = null;
-      [sessions, blocks, settings] = await Promise.all([
+      const [s, b, st, h] = await Promise.all([
         invoke<Session[]>("list_sessions"),
         invoke<BlockView[]>("list_block_views"),
         invoke<Settings>("get_settings"),
+        invoke<string[]>("list_hidden"),
       ]);
+      sessions = s;
+      blocks = b;
+      settings = st;
+      hidden = new Set(h);
     } catch (e) {
       error = String(e);
     } finally {
@@ -187,14 +214,17 @@
     return "#4ade80";
   }
 
-  const totalCost = $derived(
-    sessions.reduce((acc, s) => acc + (s.cost_usd ?? 0), 0),
-  );
+  // Popover never shows soft-hidden sessions — dashboard is the place to
+  // manage / unhide them.
+  const shownSessions = $derived(sessions.filter((s) => !hidden.has(s.session_id)));
   const liveSessions = $derived(
-    sessions.filter((s) => s.status === "active" || s.status === "idle"),
+    shownSessions.filter((s) => s.status === "active" || s.status === "idle"),
   );
-  const inactiveCount = $derived(sessions.length - liveSessions.length);
-  const visibleSessions = $derived(showAllSessions ? sessions : liveSessions);
+  const inactiveCount = $derived(shownSessions.length - liveSessions.length);
+  const visibleSessions = $derived(showAllSessions ? shownSessions : liveSessions);
+  const totalCost = $derived(
+    shownSessions.reduce((acc, s) => acc + (s.cost_usd ?? 0), 0),
+  );
   // Names that appear on more than one visible session — we suffix those
   // with a short UID so the user can tell duplicates apart at a glance.
   const dupNames = $derived.by(() => {
@@ -230,12 +260,15 @@
 <main>
   <header>
     <div class="brand">
-      <h1>cc-monitor</h1>
+      <h1>Tokenscope</h1>
       <span class="stats">
-        ${totalCost.toFixed(2)} total · {liveSessions.length} live · {sessions.length} sessions
+        ${totalCost.toFixed(2)} total · {liveSessions.length} live · {shownSessions.length} sessions
       </span>
     </div>
-    <button class="icon-btn" onclick={load} disabled={loading} title="Refresh">↻</button>
+    <div class="header-actions">
+      <button class="icon-btn" onclick={openDashboard} title="Open Dashboard">⛶</button>
+      <button class="icon-btn" onclick={load} disabled={loading} title="Refresh">↻</button>
+    </div>
   </header>
 
   <nav class="tabs">
@@ -325,6 +358,11 @@
                 {/if}
                 <dt>updated</dt><dd>{relativeTime(s.updated_at_ms)}</dd>
               </dl>
+              <div class="card-actions">
+                <button class="link" onclick={() => hideSession(s.session_id)}>
+                  Hide from popover
+                </button>
+              </div>
             {/if}
           </li>
         {/each}
@@ -433,7 +471,7 @@
       <div class="field">
         <span class="label">Pricing overrides</span>
         <span class="hint">
-          Edit <code>~/.config/cc-monitor/pricing.toml</code> to override per-million USD
+          Edit <code>~/.config/tokenscope/pricing.toml</code> to override per-million USD
           rates per model. Defaults follow Anthropic's published pricing.
         </span>
       </div>
@@ -891,5 +929,16 @@
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     flex-shrink: 0;
+  }
+
+  .header-actions {
+    display: flex;
+    gap: 6px;
+  }
+
+  .card-actions {
+    padding: 0 12px 10px 32px;
+    display: flex;
+    gap: 6px;
   }
 </style>
